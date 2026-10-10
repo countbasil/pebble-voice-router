@@ -272,6 +272,45 @@ checkObject('fails after one rate-limit retry', repeatedRateLimitFailure,
     } });
 check('does not schedule a second rate-limit retry', scheduledTimers.length, 0);
 
+section('Custom Webhook failures');
+function webhookResult(status, body) {
+    var requests = installFakeXhr();
+    var result;
+    context.sendToWebhook('Hello', { webhook_url: 'https://generic.example/hook' },
+        function(ok, data) { result = { ok: ok, data: data }; });
+    requests[0].respond(status, body);
+    return result;
+}
+checkObject('reports the status and an Anthropic-style error message',
+    webhookResult(401, '{"type":"error","error":{"type":"authentication_error","message":"OAuth access token is invalid."}}'),
+    { ok: false, data: 'HTTP 401 OAuth access token is invalid.' });
+checkObject('reports a string error field',
+    webhookResult(400, '{"error":"bad body"}'), { ok: false, data: 'HTTP 400 bad body' });
+checkObject('reports a plain-text body',
+    webhookResult(404, 'Not Found'), { ok: false, data: 'HTTP 404 Not Found' });
+checkObject('skips an HTML error page',
+    webhookResult(502, '<html><body>Bad gateway</body></html>'), { ok: false, data: 'HTTP 502' });
+checkObject('reports just the status for an empty body',
+    webhookResult(500, ''), { ok: false, data: 'HTTP 500' });
+checkObject('still passes a success body through',
+    webhookResult(200, 'Added to TickTick'), { ok: true, data: 'Added to TickTick' });
+checkObject('describes a Claude Code routine fire instead of echoing its JSON',
+    webhookResult(200, '{"type":"routine_fire","claude_code_session_id":"session_01","claude_code_session_url":"https://claude.ai/code/session_01"}'),
+    { ok: true, data: 'Claude routine started. Result arrives shortly.' });
+
+section('Custom Webhook exact words');
+function webhookBodyFor(cfg) {
+    storage.brain_dump_cfg_v1 = JSON.stringify(cfg);
+    var requests = installFakeXhr();
+    context.routeAndSend('Remind me to call mom', false);
+    return JSON.parse(requests[0].body).text;
+}
+var hookCfg = { webhook_enabled: true, webhook_url: 'https://generic.example/hook',
+                routing_auto: false, default_dest: 'webhook' };
+check('trims the opener by default', webhookBodyFor(hookCfg), 'Call mom');
+hookCfg.webhook_raw_text = true;
+check('sends the exact words when asked', webhookBodyFor(hookCfg), 'Remind me to call mom');
+
 section('Settings and watch wiring');
 var savedCfg = {
     webhook_enabled: true,

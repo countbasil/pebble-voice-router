@@ -1083,6 +1083,36 @@ function buildWebhookUrl(url, verb, payload) {
         '&timestamp=' + payload.timestamp;
 }
 
+// Short failure text for the watch: the status plus the server's own message
+// when the body carries one ({"error":{"message"}}, {"error":"..."} or
+// {"message":"..."}), else the start of a plain-text body. Without this a
+// failed send only ever said "Webhook: webhook".
+function webhookErrorText(status, body) {
+    var detail = '';
+    var raw = (body || '').trim();
+    try {
+        var r = JSON.parse(raw);
+        if (r && r.error && typeof r.error === 'object') detail = r.error.message || r.error.type || '';
+        else if (r && typeof r.error === 'string') detail = r.error;
+        else if (r && typeof r.message === 'string') detail = r.message;
+    } catch (e) {
+        if (raw.charAt(0) !== '<') detail = raw;   // skip HTML error pages
+    }
+    return 'HTTP ' + status + (detail ? ' ' + detail : '');
+}
+
+// A Claude Code routine's fire endpoint answers with session JSON, which reads
+// as noise on the watch. Say what it means instead; the routine's own result
+// lands later (TickTick, email, or a push notification). Other replies pass
+// through unchanged.
+function describeWebhookReply(body) {
+    try {
+        var r = JSON.parse(body);
+        if (r && r.type === 'routine_fire') return 'Claude routine started. Result arrives shortly.';
+    } catch (e) {}
+    return body;
+}
+
 function sendToWebhook(text, cfg, cb) {
     var url   = cfg.webhook_url;
     var verb  = (cfg.webhook_verb  || 'POST').toUpperCase();
@@ -1103,14 +1133,19 @@ function sendToWebhook(text, cfg, cb) {
     applyExtraHeaders(xhr, cfg, 'webhook');
     xhr.onload = function() {
         var isOk = this.status >= 200 && this.status < 300;
+        if (!isOk) {
+            console.log('Webhook HTTP ' + this.status + ': ' + (this.responseText || '').substring(0, 300));
+            cb(false, webhookErrorText(this.status, this.responseText));
+            return;
+        }
         // Surface the webhook's response body to the watch when present, so the
         // endpoint can reply back (e.g. confirmation text). Falls back to 'webhook'.
         var data = 'webhook';
-        if (isOk && this.responseText) {
+        if (this.responseText) {
             var rt = this.responseText.trim();
-            if (rt.length > 0) data = rt;
+            if (rt.length > 0) data = describeWebhookReply(rt);
         }
-        cb(isOk, data);
+        cb(true, data);
     };
     xhr.onerror = function() { cb(false, 'Network error'); };
     if (verb !== 'GET') {
@@ -1992,7 +2027,9 @@ function routeAndSend(text, isFollowup) {
 
     // Clean command preambles from the text before sending to the destination.
     // Original text is still used for routing, due-date extraction, and AI context.
-    var sendText = cleanNoteText(text);
+    // A webhook can opt out: an LLM on the other end (e.g. a Claude Code
+    // routine) classifies better with "remind me…" / "note:" still in place.
+    var sendText = (dest === 'webhook' && cfg.webhook_raw_text) ? text.trim() : cleanNoteText(text);
 
     var DEST_LABEL = { tasks: 'Tasks', notion: 'Notion', ai: 'AI', webhook: 'Webhook', local: 'Local', todoist: 'Todoist', nextcloud: 'Nextcloud Notes', nextcloud_tasks: 'Nextcloud Tasks', discord: 'Discord', joplin: 'Joplin', timeline: 'Timeline' };
 
@@ -2137,7 +2174,11 @@ function watchMirroredSettings(cfg) {
     return {
         DEST_MASK: computeDestMask(cfg),
         QUICK_SKIP_CONFIRM: cfg.quick_skip_confirm ? 1 : 0,
-        QUICK_AUTO_EXIT: cfg.quick_auto_exit !== false ? 1 : 0
+        QUICK_AUTO_EXIT: cfg.quick_auto_exit !== false ? 1 : 0,
+        SKIP_CONFIRM: cfg.skip_confirm ? 1 : 0,
+        CONTINUOUS_DICTATION: cfg.continuous_dictation ? 1 : 0,
+        // Seconds of silence that end a continuous note; 0 = never.
+        SILENCE_TIMEOUT: cfg.silence_stop ? (parseInt(cfg.silence_timeout, 10) || 10) : 0
     };
 }
 
@@ -2360,6 +2401,25 @@ function openSettings() {
     '<p class="note">24h / 12h clock is read directly from your watch.</p>' +
     '</div>' +
 
+    '<h3>Dictation</h3>' +
+    '<div class="section">' +
+    '<label><input type="checkbox" id="skip_confirm" ' + chk(cfg.skip_confirm) + '>' +
+    '<span>Send every note without review</span></label>' +
+    '<p class="note">Notes go out as soon as you finish speaking. The watch shows the full text while it sends and on the success screen, so you can check it afterwards. AI follow-up questions are still reviewed.</p>' +
+    '<label><input type="checkbox" id="continuous_dictation" ' + chk(cfg.continuous_dictation) + '>' +
+    '<span>Keep listening for up to a minute</span></label>' +
+    '<p class="note">The watch stops listening at each pause (and after 15 seconds), then buzzes three times. With this on it starts listening again after a short "KEEP TALKING" screen and joins everything into one note. On that screen Select saves the note and Back cancels it; Back while listening also cancels.</p>' +
+    '<label><input type="checkbox" id="silence_stop" ' + chk(cfg.silence_stop) + '>' +
+    '<span>Stop after silence</span></label>' +
+    '<label>Silence timeout:' +
+    '<select id="silence_timeout">' +
+    [5, 10, 15, 20, 30].map(function (n) {
+        return '<option value="' + n + '" ' + sel(String(cfg.silence_timeout || 10), String(n)) + '>' + n + ' seconds</option>';
+    }).join('') +
+    '</select></label>' +
+    '<p class="note">Off: pauses never end the note; press Select to save or Back to cancel (it still stops after a minute). On: the note is saved once you\'ve been quiet this long.</p>' +
+    '</div>' +
+
     '<h3>Quick Launch</h3>' +
     '<div class="section">' +
     '<label><input type="checkbox" id="quick_skip_confirm" ' + chk(cfg.quick_skip_confirm) + '>' +
@@ -2545,6 +2605,9 @@ function openSettings() {
     '<p class="note">Placeholders: <code>{text}</code> (escaped for a JSON string), <code>{text_url}</code> (escaped for a form-urlencoded body), <code>{timestamp}</code>, <code>{json}</code> (the whole default payload). Left empty, the default <code>{"text":...,"timestamp":...}</code> is sent.</p>' +
     '</div>' +
     'Bearer token (optional):<input type="password" id="webhook_token" value=\'' + esc(cfg.webhook_token) + '\'>' +
+    '<label><input type="checkbox" id="webhook_raw_text" ' + chk(cfg.webhook_raw_text) + '>' +
+    '<span>Send my exact words</span></label>' +
+    '<p class="note">Keeps openers like "remind me to", "note:" and "ask Claude" instead of trimming them. Turn on when an AI on the other end decides what to do with the note.</p>' +
     extraHeadersField('webhook', 'X-Api-Key: ...') +
     'Trigger keywords (comma-separated):<input type="text" id="webhook_keywords"' +
     ' value=\'' + esc(cfg.webhook_keywords) + '\' placeholder="send, post, hook">' +
@@ -2763,6 +2826,10 @@ function openSettings() {
     'function buildCfg(){' +
     'return {' +
     'metric_units:document.getElementById("metric_units").checked,' +
+    'skip_confirm:document.getElementById("skip_confirm").checked,' +
+    'continuous_dictation:document.getElementById("continuous_dictation").checked,' +
+    'silence_stop:document.getElementById("silence_stop").checked,' +
+    'silence_timeout:parseInt(document.getElementById("silence_timeout").value,10),' +
     'quick_skip_confirm:document.getElementById("quick_skip_confirm").checked,' +
     'quick_auto_exit:document.getElementById("quick_auto_exit").checked,' +
     'routing_auto:!document.getElementById("disable_smart_routing").checked,' +
@@ -2811,6 +2878,7 @@ function openSettings() {
     'webhook_content_type:document.getElementById("webhook_content_type").value.trim(),' +
     'webhook_body:document.getElementById("webhook_body").value.trim(),' +
     'webhook_token:document.getElementById("webhook_token").value.trim(),' +
+    'webhook_raw_text:document.getElementById("webhook_raw_text").checked,' +
     'webhook_headers:document.getElementById("webhook_headers").value.trim(),' +
     'webhook_keywords:document.getElementById("webhook_keywords").value.trim(),' +
     'discord_enabled:document.getElementById("discord_enabled").checked,' +

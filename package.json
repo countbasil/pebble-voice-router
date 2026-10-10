@@ -51,7 +51,10 @@
       "WEBHOOK_MSG",
       "QUEUE_RETRY",
       "QUICK_SKIP_CONFIRM",
-      "QUICK_AUTO_EXIT"
+      "QUICK_AUTO_EXIT",
+      "SKIP_CONFIRM",
+      "CONTINUOUS_DICTATION",
+      "SILENCE_TIMEOUT"
     ],
     "resources": {
       "media": [

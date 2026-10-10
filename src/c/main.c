@@ -9,7 +9,13 @@
 // CONSTANTS
 // ============================================================================
 
-#define NOTE_BUF_SIZE      400
+// A note can be several dictation chunks chained together (continuous mode,
+// up to a minute of speech), so it holds more than one chunk.
+#define NOTE_BUF_SIZE     1100
+#define DICTATION_BUF_SIZE 512   // one chunk; PebbleOS caps a transcript at 500
+#define CONTINUOUS_MAX_MS 60000  // stop chaining chunks after a minute
+#define CONTINUE_DELAY_MS  2000  // "keep talking" pause between chunks
+#define SILENT_RESTART_MS   300  // restart delay after a chunk that heard nothing
 #define STATUS_BUF_SIZE     48
 #define CONV_BUF_SIZE     1200
 #define MAX_HISTORY          8
@@ -20,7 +26,8 @@
 //
 // Key map — check here before claiming a new key:
 //   0      history format version      1      history count
-//   4      reminder count              5, 6   Quick Launch flags
+//   2      silence timeout (seconds)   4      reminder count
+//   5, 6   Quick Launch flags          7, 8   dictation flags
 //   10..17 history meta records        30..45 reminder entries
 //   100+   history full-text chunks (100 + slot * HISTORY_FULL_CHUNKS + chunk)
 //
@@ -41,6 +48,13 @@
 // on-watch so they're available immediately at quick-launch time).
 #define PERSIST_QUICK_SKIP_CONFIRM   5
 #define PERSIST_QUICK_AUTO_EXIT      6
+// Skip the review screen for every note, not just Quick Launch ones.
+#define PERSIST_SKIP_CONFIRM         7
+// Chain dictation chunks into one note (PebbleOS stops each after ~15s).
+#define PERSIST_CONTINUOUS           8
+// Continuous mode: end the note after this many seconds without speech
+// (0 = never; only Select/Back or the one-minute cap end it).
+#define PERSIST_SILENCE_TIMEOUT      2
 
 // Reminders (local storage, always available)
 #define MAX_REMINDERS       16
@@ -140,8 +154,15 @@ static TextLayer   *s_meta_layer;
 // --- Success ("DUMPED") window ---
 static Layer *s_success_canvas_layer;
 static int    s_success_dest = DEST_AI;
-static char   s_success_quote[64];
 static AppTimer *s_success_timer = NULL;
+// The window doubles as the in-flight screen: pushed as soon as a cloud note
+// is sent ("SENDING"), then flipped to "DUMPED" in place when the phone
+// confirms. The full transcript scrolls below the destination chip.
+static bool         s_success_pending = false;
+static ScrollLayer *s_success_scroll_layer;
+static TextLayer   *s_success_reply_layer;
+static TextLayer   *s_success_note_layer;
+static char         s_success_note_text[NOTE_BUF_SIZE + 8];
 
 // --- Send-failed fallback prompt ("Save as local note?") ---
 static Window *s_fallback_window = NULL;
@@ -214,6 +235,26 @@ static int     s_dest_mask           = DEST_BIT_AI;   // default until phone res
 static bool    s_quick_launch        = false;         // launched via long-press Quick Launch
 static bool    s_quick_note          = false;         // THIS note was started by that gesture
 static bool    s_cfg_quick_skip_confirm = false;      // route without the review screen
+static bool    s_cfg_skip_confirm       = false;      // ...for every note, not just quick ones
+static bool    s_cfg_continuous         = false;      // keep listening across chunks
+static int     s_cfg_silence_timeout_s  = 0;          // 0 = silence never ends the note
+
+// --- Continuous dictation ---
+// PebbleOS ends a dictation after ~15s or at the first pause. In continuous
+// mode each finished chunk is appended to s_note_buf and, after a short
+// "KEEP TALKING" screen (Select = save, Back = cancel), the next chunk starts
+// automatically, until a minute has passed, the silence timeout (if any)
+// runs out, or the user stops it (Select while listening also saves; see
+// the Select hook below).
+static int       s_chunk_count = 0;          // chunks appended to the current note
+static uint32_t  s_dict_start_ms = 0;        // when the note's first chunk started
+static uint32_t  s_last_speech_ms = 0;       // when a chunk last came back with words
+static int       s_chunk_aborts = 0;         // back-to-back chunks the system aborted
+static Window   *s_continue_window = NULL;
+static TextLayer *s_continue_hero_layer;
+static TextLayer *s_continue_meta_layer;
+static TextLayer *s_continue_text_layer;
+static AppTimer *s_continue_timer = NULL;
 static bool    s_cfg_quick_auto_exit    = true;       // exit once the note is saved (default on)
 static int16_t s_resp_scroll_offset  = 0;
 static int16_t s_detail_scroll_offset = 0;
@@ -256,6 +297,8 @@ static void detail_window_push(int idx);
 static void rem_detail_window_push(int display_idx);
 static void merged_rebuild(void);
 static void success_window_push(int dest);
+static void success_window_push_pending(void);
+static void success_pending_dismiss(void);
 static void fallback_window_push(const char *err);
 
 // ============================================================================
@@ -394,12 +437,18 @@ static bool is_phone_connected(void) {
     return connection_service_peek_pebble_app_connection();
 }
 
+static uint32_t now_ms(void) {
+    time_t s; uint16_t ms;
+    time_ms(&s, &ms);
+    return (uint32_t)s * 1000 + ms;
+}
+
 static void refresh_home_idle_ui(void) {
     if (!s_hero_layer || !s_meta_layer) return;
     if (strcmp(s_status_buf, "Ready") != 0) return;
     text_layer_set_text(s_hero_layer, "READY");
     text_layer_set_text(s_meta_layer,
-        is_phone_connected() ? "PRESS TO SPEAK" : "NO PHONE · LOCAL ONLY");
+        is_phone_connected() ? "SELECT saves\nBACK cancels" : "NO PHONE · LOCAL ONLY");
 }
 
 static void set_status(const char *msg) {
@@ -764,6 +813,9 @@ static void route_note(bool is_followup) {
             conv_start(s_note_buf);
         }
         appmsg_send_note(s_note_buf, is_followup);
+        // Show the full transcript while the phone works on it; the same window
+        // turns into the DUMPED screen once the send is confirmed.
+        if (!is_followup) success_window_push_pending();
     }
 }
 
@@ -791,6 +843,21 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
         s_cfg_quick_auto_exit = qae_t->value->int32 != 0;
         persist_write_bool(PERSIST_QUICK_AUTO_EXIT, s_cfg_quick_auto_exit);
     }
+    Tuple *sc_t = dict_find(iter, MESSAGE_KEY_SKIP_CONFIRM);
+    if (sc_t) {
+        s_cfg_skip_confirm = sc_t->value->int32 != 0;
+        persist_write_bool(PERSIST_SKIP_CONFIRM, s_cfg_skip_confirm);
+    }
+    Tuple *cd_t = dict_find(iter, MESSAGE_KEY_CONTINUOUS_DICTATION);
+    if (cd_t) {
+        s_cfg_continuous = cd_t->value->int32 != 0;
+        persist_write_bool(PERSIST_CONTINUOUS, s_cfg_continuous);
+    }
+    Tuple *st_t = dict_find(iter, MESSAGE_KEY_SILENCE_TIMEOUT);
+    if (st_t) {
+        s_cfg_silence_timeout_s = (int)st_t->value->int32;
+        persist_write_int(PERSIST_SILENCE_TIMEOUT, s_cfg_silence_timeout_s);
+    }
 
     // ROUTING_DONE — JS has decided destination
     Tuple *routing_t = dict_find(iter, MESSAGE_KEY_ROUTING_DONE);
@@ -817,9 +884,16 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
             }
         } else {
             if (dest == DEST_AI) {
+                // The answer gets its own response window; drop the SENDING
+                // screen so it isn't left behind underneath.
+                success_pending_dismiss();
                 set_status("Waiting for answer...");
             } else {
                 set_status("Taking action...");
+                if (s_success_pending) {
+                    s_success_dest = dest;
+                    if (s_success_canvas_layer) layer_mark_dirty(s_success_canvas_layer);
+                }
             }
         }
     }
@@ -855,6 +929,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
             Tuple *err_t = dict_find(iter, MESSAGE_KEY_ERROR_MSG);
             const char *emsg = (err_t && err_t->value->cstring[0])
                              ? err_t->value->cstring : "Error — check phone";
+            success_pending_dismiss();
             // A first-turn send failed — offer to keep the note locally so it
             // isn't lost. Followups (AI thread) just report the error.
             if (!s_is_followup && s_note_buf[0]) {
@@ -900,6 +975,7 @@ static void inbox_dropped_callback(AppMessageResult reason, void *context) {
 
 static void outbox_failed_callback(DictionaryIterator *iter,
                                    AppMessageResult reason, void *context) {
+    success_pending_dismiss();
     set_status("Send failed");
     s_waiting_response = false;
 }
@@ -908,37 +984,260 @@ static void outbox_failed_callback(DictionaryIterator *iter,
 // DICTATION CALLBACK
 // ============================================================================
 
+// The note is complete (one chunk, or the last of a continuous chain): review
+// it, or route it straight away when the review screen is skipped.
+static void continue_window_close(void) {
+    s_chunk_count = 0;
+    if (s_continue_timer) { app_timer_cancel(s_continue_timer); s_continue_timer = NULL; }
+    if (s_continue_window && window_stack_contains_window(s_continue_window)) {
+        window_stack_remove(s_continue_window, false);
+    }
+}
+
+static void dictation_finish(void) {
+    bool is_followup = s_is_followup;
+    s_is_followup = false;   // consume flag
+    continue_window_close();
+    // Hands-off capture: route straight away, no review screen — for every
+    // note, or only Quick Launch ones. Follow-ups (AI thread) keep the
+    // review step — they're already interactive.
+    if (!is_followup && (s_cfg_skip_confirm || (s_quick_note && s_cfg_quick_skip_confirm))) {
+        route_note(false);
+        return;
+    }
+    s_confirm_is_followup = is_followup;
+    confirm_window_push();
+}
+
+// Back, while recording or on the KEEP TALKING screen: throw the whole note away.
+static void dictation_cancel(void) {
+    s_is_followup = false;   // consume flag
+    continue_window_close();
+    s_note_buf[0] = '\0';
+    set_status("Ready");
+}
+
+// Another chunk only while continuous mode is on, there's time left in the
+// minute, and the buffer has room for more. AI follow-ups stay single-chunk.
+static bool dictation_wants_more(void) {
+    if (!s_cfg_continuous || s_is_followup) return false;
+    if (now_ms() - s_dict_start_ms > CONTINUOUS_MAX_MS - 3000) return false;
+    return strlen(s_note_buf) + 120 < NOTE_BUF_SIZE;
+}
+
+// --- Telling Select apart from a pause ---
+// PebbleOS reports a chunk ended by Select exactly like one ended by a pause
+// or the 15s cap. But its mic window lives on this app's window stack, so we
+// wrap that window's click config provider to also subscribe a raw Select
+// handler (raw handlers fire alongside the OS's own click handler). The OS
+// re-sets the provider on every state change, so a short poll re-wraps it.
+#define VOICE_HOOK_POLL_MS 50
+static Window             *s_voice_window = NULL;
+static ClickConfigProvider s_voice_orig_click = NULL;
+static AppTimer           *s_voice_hook_timer = NULL;
+static bool                s_voice_select_pressed = false;
+
+static void voice_select_down(ClickRecognizerRef rec, void *ctx) {
+    s_voice_select_pressed = true;
+}
+
+static void voice_click_wrap(void *ctx) {
+    if (s_voice_orig_click) s_voice_orig_click(ctx);
+    window_raw_click_subscribe(BUTTON_ID_SELECT, voice_select_down, NULL, NULL);
+}
+
+static void voice_hook_poll(void *ctx) {
+    s_voice_hook_timer = NULL;
+    if (!s_voice_window || !window_stack_contains_window(s_voice_window)) return;
+    ClickConfigProvider p = window_get_click_config_provider(s_voice_window);
+    if (p != voice_click_wrap) {
+        s_voice_orig_click = p;
+        window_set_click_config_provider_with_context(s_voice_window, voice_click_wrap,
+            window_get_click_config_context(s_voice_window));
+    }
+    s_voice_hook_timer = app_timer_register(VOICE_HOOK_POLL_MS, voice_hook_poll, NULL);
+}
+
+static void voice_hook_stop(void) {
+    if (s_voice_hook_timer) { app_timer_cancel(s_voice_hook_timer); s_voice_hook_timer = NULL; }
+    s_voice_window = NULL;
+}
+
+// Start a dictation chunk with the Select hook on its mic window.
+static void dictation_chunk_start(void) {
+    voice_hook_stop();
+    s_voice_select_pressed = false;
+    Window *below = window_stack_get_top_window();
+    if (dictation_session_start(s_dictation_session) != DictationSessionStatusSuccess) return;
+    Window *top = window_stack_get_top_window();
+    if (top && top != below) {
+        s_voice_window = top;
+        voice_hook_poll(NULL);
+    }
+}
+
+static void continue_timer_cb(void *ctx) {
+    s_continue_timer = NULL;
+    // Silence in a chained chunk is handled quietly instead of showing
+    // "Missed that" (a failure status in dictation_callback).
+    dictation_session_enable_error_dialogs(s_dictation_session, false);
+    dictation_chunk_start();
+}
+
+static void continue_save_click(ClickRecognizerRef rec, void *ctx) {
+    dictation_finish();
+}
+
+static void continue_cancel_click(ClickRecognizerRef rec, void *ctx) {
+    dictation_cancel();
+}
+
+static void continue_click_config(void *ctx) {
+    window_single_click_subscribe(BUTTON_ID_SELECT, continue_save_click);
+    window_single_click_subscribe(BUTTON_ID_BACK,   continue_cancel_click);
+}
+
+// Three quick buzzes when a chunk ends, so the user knows to pause until the
+// next chunk is listening.
+static const uint32_t s_chunk_end_vibe[] = { 50, 70, 50, 70, 50 };
+
+// Show the tail of what's been captured so far, so the user can pick up the
+// thread, and re-arm the countdown to the next chunk.
+static void continue_window_refresh(uint32_t delay_ms) {
+    if (!s_continue_text_layer) return;
+    size_t len = strlen(s_note_buf);
+    const char *tail = len > 90 ? s_note_buf + len - 90 : s_note_buf;
+    text_layer_set_text(s_continue_text_layer, tail);
+    if (s_continue_timer) app_timer_cancel(s_continue_timer);
+    s_continue_timer = app_timer_register(delay_ms, continue_timer_cb, NULL);
+}
+
+static TextLayer *continue_text_layer(GRect frame, GFont font, GColor color) {
+    TextLayer *t = text_layer_create(frame);
+    text_layer_set_background_color(t, GColorClear);
+    text_layer_set_text_color(t, color);
+    text_layer_set_font(t, font);
+    text_layer_set_text_alignment(t, GTextAlignmentCenter);
+    text_layer_set_overflow_mode(t, GTextOverflowModeWordWrap);
+    return t;
+}
+
+static void continue_window_load(Window *window) {
+    Layer *root = window_get_root_layer(window);
+    GRect b = layer_get_bounds(root);
+    window_set_background_color(window, C_SCREEN);
+    int y = b.size.h * 18 / 100;
+    int hero_h = app_font_h(AF_TITLE) + 6;
+    s_continue_hero_layer = continue_text_layer(GRect(0, y, b.size.w, hero_h),
+                                                app_font(AF_TITLE), C_ON_SCREEN);
+    text_layer_set_text(s_continue_hero_layer, "KEEP TALKING");
+    layer_add_child(root, text_layer_get_layer(s_continue_hero_layer));
+    y += hero_h;
+    int meta_h = app_font_h(AF_STATUS) * 2 + 4;
+    s_continue_meta_layer = continue_text_layer(GRect(0, y, b.size.w, meta_h),
+                                                app_font(AF_STATUS), GColorLightGray);
+    text_layer_set_text(s_continue_meta_layer, "SELECT saves\nBACK cancels");
+    layer_add_child(root, text_layer_get_layer(s_continue_meta_layer));
+    y += meta_h + 8;
+    s_continue_text_layer = continue_text_layer(GRect(8, y, b.size.w - 16, b.size.h - y),
+                                                app_font(AF_FOOTER), GColorLightGray);
+    layer_add_child(root, text_layer_get_layer(s_continue_text_layer));
+    window_set_click_config_provider(window, continue_click_config);
+}
+
+static void continue_window_unload(Window *window) {
+    text_layer_destroy(s_continue_text_layer); s_continue_text_layer = NULL;
+    text_layer_destroy(s_continue_meta_layer); s_continue_meta_layer = NULL;
+    text_layer_destroy(s_continue_hero_layer); s_continue_hero_layer = NULL;
+}
+
+// Between chunks: the window stays in the stack under the dictation UI, so
+// each later chunk just refreshes it.
+static void continue_window_show(uint32_t delay_ms) {
+    if (!s_continue_window) {
+        s_continue_window = window_create();
+        window_set_window_handlers(s_continue_window, (WindowHandlers) {
+            .load   = continue_window_load,
+            .unload = continue_window_unload,
+        });
+    }
+    if (!window_stack_contains_window(s_continue_window)) {
+        window_stack_push(s_continue_window, false);
+    }
+    continue_window_refresh(delay_ms);
+}
+
 static void dictation_callback(DictationSession *session,
                                 DictationSessionStatus status,
                                 char *transcription, void *context) {
-    bool is_followup = s_is_followup;
-    s_is_followup = false;   // consume flag
+    bool chained = s_chunk_count > 0;
+    // Select while listening (or processing) means "that's the whole note".
+    bool user_stopped = s_voice_select_pressed;
+    voice_hook_stop();
 
     if (status == DictationSessionStatusSuccess) {
-        strncpy(s_note_buf, transcription, NOTE_BUF_SIZE - 1);
-        s_note_buf[NOTE_BUF_SIZE - 1] = '\0';
-        APP_LOG(APP_LOG_LEVEL_INFO, "Dictation: %s", s_note_buf);
-        // Quick Launch hands-off capture: route straight away, no review screen.
-        // Follow-ups (AI thread) keep the review step — they're already interactive.
-        if (s_quick_note && s_cfg_quick_skip_confirm && !is_followup) {
-            route_note(false);
+        if (!chained) {
+            strncpy(s_note_buf, transcription, NOTE_BUF_SIZE - 1);
+            s_note_buf[NOTE_BUF_SIZE - 1] = '\0';
+        } else {
+            size_t used = strlen(s_note_buf);
+            snprintf(s_note_buf + used, NOTE_BUF_SIZE - used, " %s", transcription);
+        }
+        s_chunk_count++;
+        s_chunk_aborts = 0;
+        s_last_speech_ms = now_ms();
+        APP_LOG(APP_LOG_LEVEL_INFO, "Dictation chunk %d: %s", s_chunk_count, transcription);
+        if (!user_stopped && dictation_wants_more()) {
+            vibes_enqueue_custom_pattern((VibePattern) {
+                .durations = s_chunk_end_vibe,
+                .num_segments = ARRAY_LENGTH(s_chunk_end_vibe),
+            });
+            continue_window_show(CONTINUE_DELAY_MS);
             return;
         }
-        s_confirm_is_followup = is_followup;
-        confirm_window_push();
-    } else {
-        switch (status) {
-            case DictationSessionStatusFailureNoSpeechDetected:
-                set_status("No speech detected"); break;
-            case DictationSessionStatusFailureConnectivityError:
-                set_status("No connection"); break;
-            case DictationSessionStatusFailureRecognizerError:
-                set_status("Transcription error"); break;
-            case DictationSessionStatusFailureDisabled:
-                set_status("Dictation disabled"); break;
-            default:
-                set_status("Dictation failed"); break;
+        dictation_finish();
+        return;
+    }
+
+    // Back during recording cancels the whole note, chained or not.
+    if (status == DictationSessionStatusFailureTranscriptionRejected ||
+        status == DictationSessionStatusFailureTranscriptionRejectedWithError) {
+        dictation_cancel();
+        return;
+    }
+
+    if (chained) {
+        // A chained chunk that heard nothing (or nothing it could make out)
+        // is a pause: listen again, unless the silence timeout has run out.
+        // The system also aborts a session that fails to start (with error
+        // dialogs off); retry that a couple of times before giving up.
+        if (status == DictationSessionStatusFailureSystemAborted) s_chunk_aborts++;
+        bool silent = status == DictationSessionStatusFailureNoSpeechDetected ||
+                      status == DictationSessionStatusFailureRecognizerError ||
+                      (status == DictationSessionStatusFailureSystemAborted && s_chunk_aborts <= 2);
+        bool timed_out = s_cfg_silence_timeout_s > 0 &&
+            now_ms() - s_last_speech_ms >= (uint32_t)s_cfg_silence_timeout_s * 1000;
+        if (silent && !timed_out && !user_stopped && dictation_wants_more()) {
+            continue_window_show(SILENT_RESTART_MS);
+            return;
         }
+        // Anything else (an error, the minute is up) keeps what was captured.
+        dictation_finish();
+        return;
+    }
+
+    s_is_followup = false;   // consume flag
+    switch (status) {
+        case DictationSessionStatusFailureNoSpeechDetected:
+            set_status("No speech detected"); break;
+        case DictationSessionStatusFailureConnectivityError:
+            set_status("No connection"); break;
+        case DictationSessionStatusFailureRecognizerError:
+            set_status("Transcription error"); break;
+        case DictationSessionStatusFailureDisabled:
+            set_status("Dictation disabled"); break;
+        default:
+            set_status("Dictation failed"); break;
     }
 }
 
@@ -1227,7 +1526,14 @@ static void confirm_canvas_update(Layer *layer, GContext *ctx) {
 // second note dictated by hand in the same session behaves normally.
 static void start_dictation(bool quick) {
     s_quick_note = quick;
-    dictation_session_start(s_dictation_session);
+    s_chunk_count = 0;
+    s_chunk_aborts = 0;
+    s_dict_start_ms = now_ms();
+    s_last_speech_ms = s_dict_start_ms;
+    // The first chunk keeps the system "Missed that" dialogs; chained chunks
+    // turn them off so silence is handled quietly (see dictation_callback).
+    dictation_session_enable_error_dialogs(s_dictation_session, true);
+    dictation_chunk_start();
 }
 
 static void confirm_route_cb(void *ctx) {
@@ -1341,6 +1647,14 @@ static void confirm_window_unload(Window *window) {
 
 #define SUCCESS_DISMISS_MS 10000
 
+#if PBL_DISPLAY_HEIGHT <= 168
+#define SUCCESS_Y_SHIFT    5   // clear the status header / medallion
+#define SUCCESS_DUMPED_GAP 5   // breathing room under "DUMPED" before the tile
+#else
+#define SUCCESS_Y_SHIFT    0
+#define SUCCESS_DUMPED_GAP 0
+#endif
+
 // Larger check mark for the medallion (scaled by radius r around center c).
 static void draw_check_big(GContext *ctx, GPoint c, int r, GColor fg) {
     graphics_context_set_stroke_color(ctx, fg);
@@ -1357,13 +1671,9 @@ static void success_canvas_update(Layer *layer, GContext *ctx) {
     int w = bounds.size.w;
     int h = bounds.size.h;
 
-#if PBL_DISPLAY_HEIGHT <= 168
-    const int y_shift = 5;   // clear the status header / medallion
-    const int dumped_gap = 5; // breathing room under "DUMPED" before the tile
-#else
-    const int y_shift = 0;
-    const int dumped_gap = 0;
-#endif
+    const int y_shift = SUCCESS_Y_SHIFT;
+    const int dumped_gap = SUCCESS_DUMPED_GAP;
+    const char *header = s_success_pending ? "SENDING" : "SAVED";
 
     graphics_context_set_fill_color(ctx, C_SCREEN);
     graphics_fill_rect(ctx, bounds, 0, GCornerNone);
@@ -1371,10 +1681,10 @@ static void success_canvas_update(Layer *layer, GContext *ctx) {
     // Status bar: round centers the title alone; rect shows title + clock.
     graphics_context_set_text_color(ctx, GColorLightGray);
 #ifdef PBL_ROUND
-    graphics_draw_text(ctx, "SAVED", app_font(AF_STATUS),
+    graphics_draw_text(ctx, header, app_font(AF_STATUS),
         GRect(0, 1, w, STATUS_H), GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #else
-    graphics_draw_text(ctx, "SAVED", app_font(AF_STATUS),
+    graphics_draw_text(ctx, header, app_font(AF_STATUS),
         GRect(STATUS_TITLE_X, 1, STATUS_HDR_TITLE_W(w), STATUS_H),
         GTextOverflowModeFill, GTextAlignmentLeft, NULL);
     graphics_context_set_text_color(ctx, C_ON_SCREEN);
@@ -1385,21 +1695,30 @@ static void success_canvas_update(Layer *layer, GContext *ctx) {
     draw_status_divider(ctx, bounds);
 #endif
 
-    // Medallion: ring + check
+    // Medallion: ring + check (ring + three dots while still sending)
     int med_cy = h * 27 / 100 + y_shift;
     int med_r  = 22;
     graphics_context_set_stroke_color(ctx, C_ON_SCREEN);
     graphics_context_set_stroke_width(ctx, 2);
     graphics_draw_circle(ctx, GPoint(w / 2, med_cy), med_r);
-    draw_check_big(ctx, GPoint(w / 2, med_cy + 2), med_r, C_ON_SCREEN);
+    if (s_success_pending) {
+        graphics_context_set_fill_color(ctx, C_ON_SCREEN);
+        for (int i = -1; i <= 1; i++) {
+            graphics_fill_circle(ctx, GPoint(w / 2 + i * med_r * 45 / 100, med_cy), 3);
+        }
+    } else {
+        draw_check_big(ctx, GPoint(w / 2, med_cy + 2), med_r, C_ON_SCREEN);
+    }
 
-    // Title "DUMPED"
+    // Title "DUMPED" / "SENDING"
     graphics_context_set_text_color(ctx, C_ON_SCREEN);
-    graphics_draw_text(ctx, "DUMPED", app_font(AF_TITLE),
+    graphics_draw_text(ctx, s_success_pending ? "SENDING" : "DUMPED", app_font(AF_TITLE),
         GRect(0, h * 43 / 100 + y_shift, w, app_font_h(AF_TITLE) + 6),
         GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 
-    // Destination chip: bordered tile + name caps, centered as a group
+    // Destination chip: bordered tile + name caps, centered as a group. Not
+    // drawn until the phone has said where the note is going.
+    if (s_success_dest < 0) return;
     const char *name = dest_full_name(s_success_dest);
     GFont chip_font = app_font(AF_STATUS);
     int chip_h = app_font_h(AF_STATUS);
@@ -1416,22 +1735,15 @@ static void success_canvas_update(Layer *layer, GContext *ctx) {
     graphics_draw_text(ctx, name, chip_font,
         GRect(gx + tile + gap, chip_cy - chip_h / 2 - chip_h / 10, ns.w + 4, chip_h + 4),
         GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-
-    // Two-way webhook reply (if any) replaces the transcript quote — the
-    // endpoint talked back, so show what it said. Otherwise the dimmed quote.
-    bool has_reply = (s_success_dest == DEST_WEBHOOK && s_webhook_msg_buf[0]);
-    const char *footer = has_reply ? s_webhook_msg_buf : s_success_quote;
-    graphics_context_set_text_color(ctx, has_reply ? C_ON_SCREEN : GColorLightGray);
-    graphics_draw_text(ctx, footer, app_font(AF_FOOTER),
-        GRect(8, h * 70 / 100 + y_shift + dumped_gap, w - 16, 40),
-        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    // The webhook reply and the full transcript are text layers below this,
+    // in the same scroll layer (success_relayout).
 }
 
 static void success_dismiss_cb(void *ctx) {
     s_success_timer = NULL;
     if (s_success_window && window_stack_get_top_window() == s_success_window) {
         window_stack_pop(true);
-        set_status("Ready");   // restore READY / PRESS TO SPEAK on home
+        set_status("Ready");   // restore the READY idle screen on home
     }
 }
 
@@ -1446,22 +1758,94 @@ static void success_click_config(void *ctx) {
     window_single_click_subscribe(BUTTON_ID_BACK,   success_dismiss_click);
 }
 
+// Scrolling means the user is reading: stop the auto-dismiss.
+static void success_scrolled(ScrollLayer *scroll_layer, void *ctx) {
+    if (s_success_timer) { app_timer_cancel(s_success_timer); s_success_timer = NULL; }
+}
+
+// Lay out the reply + transcript under the chip and size the scroll content.
+// Auto-dismiss only once the send is confirmed and everything fits on one
+// screen; a transcript that needs scrolling stays until dismissed.
+static void success_relayout(void) {
+    if (!s_success_scroll_layer) return;
+    GRect b = layer_get_frame(scroll_layer_get_layer(s_success_scroll_layer));
+    int w = b.size.w, h = b.size.h;
+    int y = h * 70 / 100 + SUCCESS_Y_SHIFT + SUCCESS_DUMPED_GAP;
+    int tw = w - 16;
+
+    // Two-way webhook reply (if any) first — the endpoint talked back.
+    bool has_reply = (!s_success_pending && s_success_dest == DEST_WEBHOOK && s_webhook_msg_buf[0]);
+    text_layer_set_text(s_success_reply_layer, has_reply ? s_webhook_msg_buf : "");
+    int reply_h = 0;
+    if (has_reply) {
+        layer_set_frame(text_layer_get_layer(s_success_reply_layer), GRect(8, y, tw, 2000));
+        reply_h = text_layer_get_content_size(s_success_reply_layer).h + 4;
+    }
+    layer_set_frame(text_layer_get_layer(s_success_reply_layer), GRect(8, y, tw, reply_h));
+    y += reply_h;
+
+    snprintf(s_success_note_text, sizeof(s_success_note_text), "\"%s\"", s_note_buf);
+    text_layer_set_text(s_success_note_layer, s_success_note_text);
+    layer_set_frame(text_layer_get_layer(s_success_note_layer), GRect(8, y, tw, 2000));
+    int note_h = text_layer_get_content_size(s_success_note_layer).h + 4;
+    layer_set_frame(text_layer_get_layer(s_success_note_layer), GRect(8, y, tw, note_h));
+
+    int content_h = y + note_h + 8;
+    if (content_h < h) content_h = h;
+    scroll_layer_set_content_size(s_success_scroll_layer, GSize(w, content_h));
+    if (s_success_canvas_layer) layer_mark_dirty(s_success_canvas_layer);
+
+    if (s_success_timer) { app_timer_cancel(s_success_timer); s_success_timer = NULL; }
+    if (!s_success_pending && content_h <= h) {
+        s_success_timer = app_timer_register(SUCCESS_DISMISS_MS, success_dismiss_cb, NULL);
+    }
+}
+
+static TextLayer *success_text_layer_create(GColor color) {
+    TextLayer *t = text_layer_create(GRect(0, 0, 0, 0));
+    text_layer_set_background_color(t, GColorClear);
+    text_layer_set_text_color(t, color);
+    text_layer_set_font(t, app_font(AF_FOOTER));
+    text_layer_set_text_alignment(t, GTextAlignmentCenter);
+    text_layer_set_overflow_mode(t, GTextOverflowModeWordWrap);
+    return t;
+}
+
 static void success_window_load(Window *window) {
     Layer *root = window_get_root_layer(window);
     GRect b = layer_get_bounds(root);
     window_set_background_color(window, C_SCREEN);
 
+    s_success_scroll_layer = scroll_layer_create(b);
+    scroll_layer_set_shadow_hidden(s_success_scroll_layer, true);
+    scroll_layer_set_callbacks(s_success_scroll_layer, (ScrollLayerCallbacks) {
+        .click_config_provider = success_click_config,
+        .content_offset_changed_handler = success_scrolled,
+    });
+    scroll_layer_set_click_config_onto_window(s_success_scroll_layer, window);
+    layer_add_child(root, scroll_layer_get_layer(s_success_scroll_layer));
+
+    // The canvas keeps its original one-screen geometry; text scrolls below it.
     s_success_canvas_layer = layer_create(b);
     layer_set_update_proc(s_success_canvas_layer, success_canvas_update);
-    layer_add_child(root, s_success_canvas_layer);
+    scroll_layer_add_child(s_success_scroll_layer, s_success_canvas_layer);
 
-    window_set_click_config_provider(window, success_click_config);
-    s_success_timer = app_timer_register(SUCCESS_DISMISS_MS, success_dismiss_cb, NULL);
+    s_success_reply_layer = success_text_layer_create(C_ON_SCREEN);
+    scroll_layer_add_child(s_success_scroll_layer, text_layer_get_layer(s_success_reply_layer));
+    s_success_note_layer = success_text_layer_create(GColorLightGray);
+    scroll_layer_add_child(s_success_scroll_layer, text_layer_get_layer(s_success_note_layer));
+
+    success_relayout();
 }
 
 static void success_window_unload(Window *window) {
     if (s_success_timer) { app_timer_cancel(s_success_timer); s_success_timer = NULL; }
-    layer_destroy(s_success_canvas_layer); s_success_canvas_layer = NULL;
+    // Dismissed while still sending: the result, when it comes, gets a fresh window.
+    s_success_pending = false;
+    text_layer_destroy(s_success_note_layer);   s_success_note_layer  = NULL;
+    text_layer_destroy(s_success_reply_layer);  s_success_reply_layer = NULL;
+    layer_destroy(s_success_canvas_layer);      s_success_canvas_layer = NULL;
+    scroll_layer_destroy(s_success_scroll_layer); s_success_scroll_layer = NULL;
 }
 
 // ============================================================================
@@ -1733,12 +2117,12 @@ static void home_window_load(Window *window) {
     text_layer_set_text(s_hero_layer, "READY");
     layer_add_child(root, text_layer_get_layer(s_hero_layer));
 
-    s_meta_layer = text_layer_create(GRect(0, hero_y + hero_line + 2, text_w, app_font_h(AF_FOOTER) + 4));
+    s_meta_layer = text_layer_create(GRect(0, hero_y + hero_line + 2, text_w, app_font_h(AF_FOOTER) * 2 + 4));
     text_layer_set_background_color(s_meta_layer, GColorClear);
     text_layer_set_text_color(s_meta_layer, GColorLightGray);
     text_layer_set_font(s_meta_layer, app_font(AF_FOOTER));
     text_layer_set_text_alignment(s_meta_layer, GTextAlignmentCenter);
-    text_layer_set_text(s_meta_layer, "PRESS TO SPEAK");
+    text_layer_set_text(s_meta_layer, "SELECT saves\nBACK cancels");
     layer_add_child(root, text_layer_get_layer(s_meta_layer));
 
     window_set_click_config_provider(window, home_click_config);
@@ -2449,10 +2833,11 @@ static void detail_window_push(int idx) {
     window_stack_push(s_detail_window, true);
 }
 
-static void success_window_push(int dest) {
-    s_success_dest = dest;
-    snprintf(s_success_quote, sizeof(s_success_quote), "\"%.58s\"", s_note_buf);
+static void success_window_create_and_push(void) {
     if (s_success_window) {
+        if (window_stack_contains_window(s_success_window)) {
+            window_stack_remove(s_success_window, false);
+        }
         window_destroy(s_success_window);
         s_success_window = NULL;
     }
@@ -2462,6 +2847,38 @@ static void success_window_push(int dest) {
         .unload = success_window_unload,
     });
     window_stack_push(s_success_window, true);
+}
+
+// The send is confirmed. If the SENDING screen is still up, flip it to DUMPED
+// in place (keeping the user's scroll position); otherwise push a fresh one.
+static void success_window_push(int dest) {
+    s_success_dest = dest;
+    if (s_success_pending && s_success_window && window_stack_contains_window(s_success_window)) {
+        s_success_pending = false;
+        success_relayout();
+        return;
+    }
+    s_success_pending = false;
+    success_window_create_and_push();
+}
+
+// A cloud note just went to the phone: show it while the phone works on it.
+// The destination chip appears once ROUTING_DONE names it.
+static void success_window_push_pending(void) {
+    s_success_dest = -1;
+    s_webhook_msg_buf[0] = '\0';
+    s_success_pending = true;
+    success_window_create_and_push();
+}
+
+// The send failed or turned into an AI conversation: take the SENDING screen
+// down so the fallback / response window isn't stacked on top of it.
+static void success_pending_dismiss(void) {
+    if (!s_success_pending) return;
+    s_success_pending = false;
+    if (s_success_window && window_stack_contains_window(s_success_window)) {
+        window_stack_remove(s_success_window, false);
+    }
 }
 
 static void rem_detail_window_push(int display_idx) {
@@ -2508,15 +2925,18 @@ static void init(void) {
     app_message_register_inbox_received(inbox_received_callback);
     app_message_register_inbox_dropped(inbox_dropped_callback);
     app_message_register_outbox_failed(outbox_failed_callback);
-    app_message_open(512, 512);
+    // Outbox fits a full continuous-mode note (NOTE_TEXT up to NOTE_BUF_SIZE).
+    uint32_t outbox = NOTE_BUF_SIZE + 128;
+    if (outbox > app_message_outbox_size_maximum()) outbox = app_message_outbox_size_maximum();
+    app_message_open(512, outbox);
 
     connection_service_subscribe((ConnectionHandlers) {
         .pebble_app_connection_handler = connection_handler,
     });
 
-    // Dictation session (buffer 400 bytes)
+    // Dictation session: one chunk's worth of transcript
     s_dictation_session = dictation_session_create(
-        NOTE_BUF_SIZE, dictation_callback, NULL);
+        DICTATION_BUF_SIZE, dictation_callback, NULL);
     dictation_session_enable_confirmation(s_dictation_session, false);
     dictation_session_enable_error_dialogs(s_dictation_session, true);
 
@@ -2537,6 +2957,9 @@ static void init(void) {
     // opt-in flag needs no persist_exists(). Auto-exit defaults to ON, so there
     // the exists check is what separates "never configured" from "turned off".
     s_cfg_quick_skip_confirm = persist_read_bool(PERSIST_QUICK_SKIP_CONFIRM);
+    s_cfg_skip_confirm       = persist_read_bool(PERSIST_SKIP_CONFIRM);
+    s_cfg_continuous         = persist_read_bool(PERSIST_CONTINUOUS);
+    s_cfg_silence_timeout_s  = persist_read_int(PERSIST_SILENCE_TIMEOUT);
     s_cfg_quick_auto_exit    = !persist_exists(PERSIST_QUICK_AUTO_EXIT)
                                || persist_read_bool(PERSIST_QUICK_AUTO_EXIT);
 
@@ -2558,6 +2981,7 @@ static void deinit(void) {
     if (s_brain_bmp)         { gbitmap_destroy(s_brain_bmp); s_brain_bmp = NULL; }
     if (s_fallback_window)   { window_destroy(s_fallback_window);   }
     if (s_success_window)    { window_destroy(s_success_window);    }
+    if (s_continue_window)   { window_destroy(s_continue_window);   }
     if (s_rem_detail_window) { window_destroy(s_rem_detail_window); }
     if (s_detail_window)     { window_destroy(s_detail_window);     }
     if (s_history_window)    { window_destroy(s_history_window);    }

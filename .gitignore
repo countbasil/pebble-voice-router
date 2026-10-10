@@ -4,3 +4,4 @@ src/pkjs/secrets.js
 secrets.js
 screens_tmp/
 .DS_Store
+compile_commands.json

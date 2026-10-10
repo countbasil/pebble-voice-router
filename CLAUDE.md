@@ -55,6 +55,10 @@ Note flow:
 2. On confirm, the watch sends `NOTE_TEXT` (+ `NOTE_IS_FOLLOWUP` for AI threads) → `routeAndSend` → the phone replies `ROUTING_DONE`, then `CONFIRM: 1` (success, with `DEST_USED`, optional `EXTERNAL_ID` / `WEBHOOK_MSG`) or `CONFIRM: 2` + `ERROR_MSG`. AI replies come back as `AI_RESPONSE` / `AI_RESPONSE_DONE`.
 3. On failure the watch shows a fallback screen. "Retry later" sends `QUEUE_RETRY`, and the phone moves `s_pending_retry` into the persistent retry queue. "Save to local" keeps the note on-watch. These two paths are deliberately mutually exclusive so a note is never duplicated.
 
+While a non-follow-up cloud send is in flight, the success window is already on screen in a pending "SENDING" state (`s_success_pending`) showing the full transcript. `CONFIRM: 1` flips that same window to "DUMPED". Failure, or `ROUTING_DONE` naming the AI destination, removes it via `success_pending_dismiss()`. The review screen is skipped when `SKIP_CONFIRM` is on (every note) or `QUICK_SKIP_CONFIRM` is on (Quick Launch notes only).
+
+PebbleOS ends a dictation at the first pause or after 15s (hard-coded in its `voice_window.c`), and an app can't change that. With `CONTINUOUS_DICTATION` on, `dictation_callback` appends each chunk to `s_note_buf` and shows a "KEEP TALKING" window (`CONTINUE_DELAY_MS`) before starting the next chunk, up to `CONTINUOUS_MAX_MS`. Each chunk that comes back with words triggers a triple vibe. Select on that window saves the note (`dictation_finish()`); Back there, or Back while the system mic is listening (status `FailureTranscriptionRejected`), discards it (`dictation_cancel()`). Select while listening also saves the note. The OS reports that chunk exactly like a pause, so `dictation_chunk_start()` wraps the system mic window's click config provider (it lives on the app's window stack) to add a raw Select handler that sets `s_voice_select_pressed`; the OS resets the provider on each state change, so `voice_hook_poll` re-wraps it every 50ms. A chained chunk with no words restarts quietly unless `SILENCE_TIMEOUT` seconds (0 = never, from the settings page) have passed since the last words. The OS dictation screen itself can't be changed, so on-screen instructions live on READY and KEEP TALKING.
+
 `pickDest()` is the single source of truth for destination choice, used by both the classify-only preview and the real send, so the preview always matches. It also forces task-like text away from `ai`.
 
 `sendToWatch()` serializes outgoing AppMessages through an outbox, because only one can be in flight at a time. Always use it, never `Pebble.sendAppMessage` directly.
@@ -73,3 +77,17 @@ Adding a destination means touching all of these plus the settings page (`openSe
 
 ### Watch-side persistence
 `main.c` uses numbered persist keys with explicit layout (`PERSIST_*` defines). History is versioned by `PERSIST_HISTORY_VERSION`, and long text is split into 200-byte chunks because of the 256-byte persist value cap. If you change the history record layout, bump the version.
+
+## Voice inbox routine (Aaron's setup)
+
+Notes reach a Claude Code routine through the webhook destination; see `docs/voice-inbox-routine.md`. The routine is **Voice inbox**, `trig_0114xdVHWQNcsQ63o1LmyGJ9`.
+
+`docs/voice-inbox-prompt.md` is the source of truth for the routine's prompt; the file contains only the prompt text. **Whenever that file changes, sync it to the routine in the same turn without being asked.** Use `RemoteTrigger` with `action: "update"`:
+- Send the whole `job_config.ccr` block: `environment_id`, `session_context` (`sources`, `allowed_tools`, `outcomes`) and `events`. Copy every value except the prompt from a fresh `action: "get"`, not from memory.
+- `events[0].data` is `{uuid: <new lowercase v4>, session_id: "", type: "user", parent_tool_use_id: null, message: {role: "user", content: <file contents>}}`.
+- Leave `mcp_connections` out; it's set separately and stays as it is.
+- Afterwards, check that `derived_state.prompt` in the response matches the file.
+
+To debug a run, use `RemoteTrigger` `list_runs`, then `get_run_log`.
+
+The routine's cloud session clock is UTC. Any date logic in the prompt has to say explicitly how to get the Pacific date.
