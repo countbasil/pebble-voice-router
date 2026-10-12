@@ -1,6 +1,6 @@
 # Voice inbox: Brain Dump → Claude Code routine
 
-Every note you dictate goes to a Claude Code routine. The routine picks an action from how the note starts: "remind me to…" adds a TickTick task, "email me…" researches and emails you the answer, "add to buffer…" researches and saves it to Readwise Reader (tag `buffer`), "create an event" / "make an event" / "appointment…" adds a Google Calendar event, and anything else becomes a TickTick note. Each run is also a Claude Code session at claude.ai/code that you can open later.
+Every note you dictate goes to a Claude Code routine. The routine picks an action from how the note starts: "remind me to…" adds a TickTick task, "email me…" researches and emails you the answer, "add to buffer…" / "save to Readwise…" (or "add to Reader…" etc.) researches and saves it to Readwise Reader (tag `buffer`), "create an event" / "make an event" / "appointment…" adds a Google Calendar event, and anything else becomes a TickTick note. Each run is also a Claude Code session at claude.ai/code that you can open later.
 
 ## 1. Create the routine (web only)
 
