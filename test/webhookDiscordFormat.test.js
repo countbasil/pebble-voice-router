@@ -294,9 +294,9 @@ checkObject('reports just the status for an empty body',
     webhookResult(500, ''), { ok: false, data: 'HTTP 500' });
 checkObject('still passes a success body through',
     webhookResult(200, 'Added to TickTick'), { ok: true, data: 'Added to TickTick' });
-checkObject('describes a Claude Code routine fire instead of echoing its JSON',
+checkObject('shows no reply for a Claude Code routine fire instead of echoing its JSON',
     webhookResult(200, '{"type":"routine_fire","claude_code_session_id":"session_01","claude_code_session_url":"https://claude.ai/code/session_01"}'),
-    { ok: true, data: 'Claude routine started. Result arrives shortly.' });
+    { ok: true, data: 'webhook' });
 
 section('Custom Webhook exact words');
 function webhookBodyFor(cfg) {

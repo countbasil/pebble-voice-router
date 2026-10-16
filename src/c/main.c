@@ -10,17 +10,27 @@
 // ============================================================================
 
 // A note can be several dictation chunks chained together (continuous mode,
-// up to a minute of speech), so it holds more than one chunk.
-#define NOTE_BUF_SIZE     1100
-#define DICTATION_BUF_SIZE 512   // one chunk; PebbleOS caps a transcript at 500
-#define CONTINUOUS_MAX_MS 60000  // stop chaining chunks after a minute
+// up to the max note length setting), so it holds more than one chunk.
+// Sizes scale with app RAM: 128K on emery/gabbro, 64K elsewhere. Pauses cost
+// nothing here — only transcribed words fill the buffer.
+#if defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO)
+#define NOTE_BUF_SIZE     4000   // ~5 minutes of actual speech
+#define DICTATION_BUF_SIZE 2048  // one chunk; room for a longer per-chunk OS limit
+#define HISTORY_FULL_CHUNKS 20   // 20 × 200 = 4000 = NOTE_BUF_SIZE
+#else
+#define NOTE_BUF_SIZE     2000
+#define DICTATION_BUF_SIZE 1024
+#define HISTORY_FULL_CHUNKS  3   // 3 × 200 = 600; 8 slots of more won't fit in 64K
+#endif
+#define AI_RESPONSE_BUF_SIZE 1100
+#define MAX_NOTE_MIN_DEFAULT  1   // stop chaining chunks after this many minutes
 #define CONTINUE_DELAY_MS  2000  // "keep talking" pause between chunks
 #define SILENT_RESTART_MS   300  // restart delay after a chunk that heard nothing
 #define STATUS_BUF_SIZE     48
 #define CONV_BUF_SIZE     1200
 #define MAX_HISTORY          8
 #define HISTORY_SHORT_LEN   48
-#define HISTORY_FULL_LEN   600   // stores full conversation thread
+#define HISTORY_FULL_LEN   (HISTORY_FULL_CHUNK * HISTORY_FULL_CHUNKS)  // note or AI thread
 
 // Persistent storage keys
 //
@@ -28,7 +38,8 @@
 //   0      history format version      1      history count
 //   2      silence timeout (seconds)   4      reminder count
 //   5, 6   Quick Launch flags          7, 8   dictation flags
-//   10..17 history meta records        30..45 reminder entries
+//   10..17 history meta records        18     max note length (minutes)
+//   30..45 reminder entries
 //   100+   history full-text chunks (100 + slot * HISTORY_FULL_CHUNKS + chunk)
 //
 // Pebble caps each persist value at 256 bytes, so a history entry can't be one
@@ -36,12 +47,11 @@
 // We split it: a small meta record (short+dest+ts, ~53 B) per slot, plus the
 // full transcript chunked across HISTORY_FULL_CHUNKS string keys.
 #define PERSIST_HISTORY_VERSION_KEY  0
-#define PERSIST_HISTORY_VERSION      5   // v5: HistoryMeta.external_id for remote complete
+#define PERSIST_HISTORY_VERSION      6   // v6: full text in HISTORY_FULL_CHUNKS (per platform) keys
 #define HISTORY_EXT_ID_LEN          40
 #define PERSIST_HISTORY_COUNT        1
 #define PERSIST_HISTORY_BASE        10   // meta records at 10..17
 #define HISTORY_FULL_CHUNK         200   // bytes per full-text chunk (< 256 persist cap)
-#define HISTORY_FULL_CHUNKS          3   // 3 × 200 = 600 = HISTORY_FULL_LEN
 #define PERSIST_HIST_FULL_BASE     100   // chunk c of slot s at 100 + s*CHUNKS + c
 
 // Quick Launch behavior flags (set from the phone settings page, persisted
@@ -53,8 +63,13 @@
 // Chain dictation chunks into one note (PebbleOS stops each after ~15s).
 #define PERSIST_CONTINUOUS           8
 // Continuous mode: end the note after this many seconds without speech
-// (0 = never; only Select/Back or the one-minute cap end it).
+// (0 = never; only Select/Back or the max note length end it).
 #define PERSIST_SILENCE_TIMEOUT      2
+// Continuous mode: stop chaining chunks this many minutes after the note began.
+#define PERSIST_MAX_NOTE_MIN        18
+// Mic start/stop vibration presets (0 = off; see s_vibe_start_ms).
+#define PERSIST_VIBE_START           3
+#define PERSIST_VIBE_STOP            9
 
 // Reminders (local storage, always available)
 #define MAX_REMINDERS       16
@@ -159,6 +174,7 @@ static AppTimer *s_success_timer = NULL;
 // is sent ("SENDING"), then flipped to "DUMPED" in place when the phone
 // confirms. The full transcript scrolls below the destination chip.
 static bool         s_success_pending = false;
+static bool         s_success_scrolled = false;   // user scrolled: no auto-dismiss
 static ScrollLayer *s_success_scroll_layer;
 static TextLayer   *s_success_reply_layer;
 static TextLayer   *s_success_note_layer;
@@ -220,7 +236,7 @@ static DictationSession *s_dictation_session;
 
 // --- Buffers ---
 static char s_note_buf[NOTE_BUF_SIZE];
-static char s_ai_response_buf[NOTE_BUF_SIZE];
+static char s_ai_response_buf[AI_RESPONSE_BUF_SIZE];
 static char s_status_buf[STATUS_BUF_SIZE];
 static char s_webhook_msg_buf[120];   // two-way webhook reply shown on success screen
 static char s_conversation_buf[CONV_BUF_SIZE];
@@ -238,12 +254,17 @@ static bool    s_cfg_quick_skip_confirm = false;      // route without the revie
 static bool    s_cfg_skip_confirm       = false;      // ...for every note, not just quick ones
 static bool    s_cfg_continuous         = false;      // keep listening across chunks
 static int     s_cfg_silence_timeout_s  = 0;          // 0 = silence never ends the note
+static int     s_cfg_max_note_min       = MAX_NOTE_MIN_DEFAULT;  // continuous-mode cap
+#define VIBE_PRESETS        4
+#define VIBE_PRESET_DEFAULT 2
+static int     s_cfg_vibe_start         = VIBE_PRESET_DEFAULT;
+static int     s_cfg_vibe_stop          = VIBE_PRESET_DEFAULT;
 
 // --- Continuous dictation ---
 // PebbleOS ends a dictation after ~15s or at the first pause. In continuous
 // mode each finished chunk is appended to s_note_buf and, after a short
 // "KEEP TALKING" screen (Select = save, Back = cancel), the next chunk starts
-// automatically, until a minute has passed, the silence timeout (if any)
+// automatically, until the max note length has passed, the silence timeout (if any)
 // runs out, or the user stops it (Select while listening also saves; see
 // the Select hook below).
 static int       s_chunk_count = 0;          // chunks appended to the current note
@@ -262,7 +283,9 @@ static int16_t s_detail_scroll_offset = 0;
 // --- History ---
 static int      s_history_count = 0;
 static char     s_history_short[MAX_HISTORY][HISTORY_SHORT_LEN];
-static char     s_history_full [MAX_HISTORY][HISTORY_FULL_LEN];
+// Heap-allocated in init(): on emery/gabbro it's 32K, and an app's static
+// footprint (.text + .data + .bss) must stay under 64K on every platform.
+static char   (*s_history_full)[HISTORY_FULL_LEN];
 static char     s_history_ext_id[MAX_HISTORY][HISTORY_EXT_ID_LEN];
 static uint8_t  s_history_dest [MAX_HISTORY];
 static uint32_t s_history_ts   [MAX_HISTORY];
@@ -300,6 +323,7 @@ static void success_window_push(int dest);
 static void success_window_push_pending(void);
 static void success_pending_dismiss(void);
 static void fallback_window_push(const char *err);
+static void mic_vibe_preview(void);
 
 // ============================================================================
 // HELPERS
@@ -477,17 +501,14 @@ static ReminderEntry s_rem_entry_buf;
 static char          s_hist_chunk_buf[HISTORY_FULL_CHUNK + 1];
 
 // Write a transcript across HISTORY_FULL_CHUNKS string keys for the given slot.
+// Stops after the first short (or empty) chunk, which is where reading stops,
+// so a short note doesn't rewrite all of the slot's keys.
 static void history_write_full(int slot, const char *full) {
     int len = (int)strlen(full);
-    for (int c = 0; c < HISTORY_FULL_CHUNKS; c++) {
+    for (int c = 0; c < HISTORY_FULL_CHUNKS && c * HISTORY_FULL_CHUNK <= len; c++) {
         uint32_t key = (uint32_t)(PERSIST_HIST_FULL_BASE + slot * HISTORY_FULL_CHUNKS + c);
-        int off = c * HISTORY_FULL_CHUNK;
-        if (off < len) {
-            strncpy(s_hist_chunk_buf, full + off, HISTORY_FULL_CHUNK);
-            s_hist_chunk_buf[HISTORY_FULL_CHUNK] = '\0';
-        } else {
-            s_hist_chunk_buf[0] = '\0';
-        }
+        strncpy(s_hist_chunk_buf, full + c * HISTORY_FULL_CHUNK, HISTORY_FULL_CHUNK);
+        s_hist_chunk_buf[HISTORY_FULL_CHUNK] = '\0';
         persist_write_string(key, s_hist_chunk_buf);
     }
 }
@@ -607,7 +628,7 @@ static void history_delete(int display_idx) {
     }
     for (int i = display_idx; i < s_history_count - 1; i++) {
         strncpy(s_history_short[i], s_history_short[i + 1], HISTORY_SHORT_LEN);
-        strncpy(s_history_full[i], s_history_full[i + 1], HISTORY_FULL_LEN);
+        memmove(s_history_full[i], s_history_full[i + 1], HISTORY_FULL_LEN);
         strncpy(s_history_ext_id[i], s_history_ext_id[i + 1], HISTORY_EXT_ID_LEN);
         s_history_dest[i] = s_history_dest[i + 1];
         s_history_ts[i] = s_history_ts[i + 1];
@@ -823,6 +844,14 @@ static void route_note(bool is_followup) {
 // APPMESSAGE — INBOX
 // ============================================================================
 
+static int vibe_preset_clamp(int v) {
+    return (v >= 0 && v < VIBE_PRESETS) ? v : VIBE_PRESET_DEFAULT;
+}
+
+static int max_note_min_clamp(int v) {
+    return (v >= 1 && v <= 30) ? v : MAX_NOTE_MIN_DEFAULT;
+}
+
 static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     // DEST_MASK — sent by phone on ready
     Tuple *mask_t = dict_find(iter, MESSAGE_KEY_DEST_MASK);
@@ -858,6 +887,23 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
         s_cfg_silence_timeout_s = (int)st_t->value->int32;
         persist_write_int(PERSIST_SILENCE_TIMEOUT, s_cfg_silence_timeout_s);
     }
+    Tuple *mn_t = dict_find(iter, MESSAGE_KEY_MAX_NOTE_MIN);
+    if (mn_t) {
+        s_cfg_max_note_min = max_note_min_clamp((int)mn_t->value->int32);
+        persist_write_int(PERSIST_MAX_NOTE_MIN, s_cfg_max_note_min);
+    }
+    Tuple *vs_t = dict_find(iter, MESSAGE_KEY_VIBE_START);
+    if (vs_t) {
+        s_cfg_vibe_start = vibe_preset_clamp((int)vs_t->value->int32);
+        persist_write_int(PERSIST_VIBE_START, s_cfg_vibe_start);
+    }
+    Tuple *vp_t = dict_find(iter, MESSAGE_KEY_VIBE_STOP);
+    if (vp_t) {
+        s_cfg_vibe_stop = vibe_preset_clamp((int)vp_t->value->int32);
+        persist_write_int(PERSIST_VIBE_STOP, s_cfg_vibe_stop);
+    }
+    // Sent when the settings page saved new mic vibes, so they can be felt.
+    if (dict_find(iter, MESSAGE_KEY_VIBE_PREVIEW)) mic_vibe_preview();
 
     // ROUTING_DONE — JS has decided destination
     Tuple *routing_t = dict_find(iter, MESSAGE_KEY_ROUTING_DONE);
@@ -944,8 +990,8 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     // AI_RESPONSE — show on response window
     Tuple *ai_t = dict_find(iter, MESSAGE_KEY_AI_RESPONSE);
     if (ai_t) {
-        strncpy(s_ai_response_buf, ai_t->value->cstring, NOTE_BUF_SIZE - 1);
-        s_ai_response_buf[NOTE_BUF_SIZE - 1] = '\0';
+        strncpy(s_ai_response_buf, ai_t->value->cstring, AI_RESPONSE_BUF_SIZE - 1);
+        s_ai_response_buf[AI_RESPONSE_BUF_SIZE - 1] = '\0';
     }
 
     Tuple *done_t = dict_find(iter, MESSAGE_KEY_AI_RESPONSE_DONE);
@@ -1017,11 +1063,12 @@ static void dictation_cancel(void) {
     set_status("Ready");
 }
 
-// Another chunk only while continuous mode is on, there's time left in the
-// minute, and the buffer has room for more. AI follow-ups stay single-chunk.
+// Another chunk only while continuous mode is on, there's time left before
+// the max note length, and the buffer has room for more. AI follow-ups stay
+// single-chunk. Pauses count toward the time, so it's generous by design.
 static bool dictation_wants_more(void) {
     if (!s_cfg_continuous || s_is_followup) return false;
-    if (now_ms() - s_dict_start_ms > CONTINUOUS_MAX_MS - 3000) return false;
+    if (now_ms() - s_dict_start_ms > (uint32_t)s_cfg_max_note_min * 60000 - 3000) return false;
     return strlen(s_note_buf) + 120 < NOTE_BUF_SIZE;
 }
 
@@ -1031,11 +1078,59 @@ static bool dictation_wants_more(void) {
 // wrap that window's click config provider to also subscribe a raw Select
 // handler (raw handlers fire alongside the OS's own click handler). The OS
 // re-sets the provider on every state change, so a short poll re-wraps it.
+//
+// The same poll tells when the mic is live. The window starts with a
+// Back-only provider and switches to a Back+Select one exactly while it is
+// recording (the OS mic is already on by then), then back again when
+// recording ends. The OS gives no vibe of its own, so we buzz on both edges.
+// A stop the phone triggers (a pause) only shows up once the transcript
+// arrives, so that buzz lags the mic by the transcription time; Select and
+// the 15s cap are immediate.
 #define VOICE_HOOK_POLL_MS 50
 static Window             *s_voice_window = NULL;
 static ClickConfigProvider s_voice_orig_click = NULL;
+static ClickConfigProvider s_voice_idle_click = NULL;   // the Back-only provider
 static AppTimer           *s_voice_hook_timer = NULL;
 static bool                s_voice_select_pressed = false;
+static bool                s_voice_listening = false;
+
+// Three pulses: the mic is on, start talking. One buzz: it's off. The
+// settings page picks a preset for each; index 0 is off, and the order must
+// match VIBE_START_PRESETS / VIBE_STOP_PRESETS in pkjs. Apps can't raise the
+// motor's strength (that's the watch's System vibe intensity setting), only
+// the length.
+static const uint32_t s_vibe_start_ms[VIBE_PRESETS][2] = {   // { pulse, gap }
+    { 0, 0 }, { 100, 60 }, { 175, 75 }, { 250, 150 },
+};
+static const uint32_t s_vibe_stop_ms[VIBE_PRESETS] = { 0, 400, 700, 1000 };
+
+// Plays the start and/or stop preset (0 = skip), with gap_ms of quiet
+// between them when both play.
+static void mic_vibe_play(int start, int stop, uint32_t gap_ms) {
+    uint32_t segs[7];   // alternating on/off, starting with on
+    int n = 0;
+    for (int i = 0; start > 0 && i < 3; i++) {
+        if (i) segs[n++] = s_vibe_start_ms[start][1];
+        segs[n++] = s_vibe_start_ms[start][0];
+    }
+    if (stop > 0) {
+        if (n) segs[n++] = gap_ms;
+        segs[n++] = s_vibe_stop_ms[stop];
+    }
+    if (n) vibes_enqueue_custom_pattern((VibePattern) { .durations = segs, .num_segments = n });
+}
+
+static void mic_vibe_preview(void) {
+    mic_vibe_play(s_cfg_vibe_start, s_cfg_vibe_stop, 1000);
+}
+
+static void voice_listening_set(bool listening) {
+    if (listening == s_voice_listening) return;
+    s_voice_listening = listening;
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "Mic %s", listening ? "listening" : "stopped");
+    if (listening) mic_vibe_play(s_cfg_vibe_start, 0, 0);
+    else           mic_vibe_play(0, s_cfg_vibe_stop, 0);
+}
 
 static void voice_select_down(ClickRecognizerRef rec, void *ctx) {
     s_voice_select_pressed = true;
@@ -1051,6 +1146,10 @@ static void voice_hook_poll(void *ctx) {
     if (!s_voice_window || !window_stack_contains_window(s_voice_window)) return;
     ClickConfigProvider p = window_get_click_config_provider(s_voice_window);
     if (p != voice_click_wrap) {
+        if (p) {
+            if (!s_voice_idle_click) s_voice_idle_click = p;
+            else voice_listening_set(p != s_voice_idle_click);
+        }
         s_voice_orig_click = p;
         window_set_click_config_provider_with_context(s_voice_window, voice_click_wrap,
             window_get_click_config_context(s_voice_window));
@@ -1060,7 +1159,10 @@ static void voice_hook_poll(void *ctx) {
 
 static void voice_hook_stop(void) {
     if (s_voice_hook_timer) { app_timer_cancel(s_voice_hook_timer); s_voice_hook_timer = NULL; }
+    // The window can close before the poll sees it stop recording.
+    voice_listening_set(false);
     s_voice_window = NULL;
+    s_voice_idle_click = NULL;
 }
 
 // Start a dictation chunk with the Select hook on its mic window.
@@ -1097,17 +1199,26 @@ static void continue_click_config(void *ctx) {
     window_single_click_subscribe(BUTTON_ID_BACK,   continue_cancel_click);
 }
 
-// Three quick buzzes when a chunk ends, so the user knows to pause until the
-// next chunk is listening.
-static const uint32_t s_chunk_end_vibe[] = { 50, 70, 50, 70, 50 };
-
 // Show the tail of what's been captured so far, so the user can pick up the
-// thread, and re-arm the countdown to the next chunk.
+// thread, and re-arm the countdown to the next chunk. The tail starts at a
+// word and is trimmed from the front until it fits, so the last words show.
 static void continue_window_refresh(uint32_t delay_ms) {
     if (!s_continue_text_layer) return;
+    Layer *tl = text_layer_get_layer(s_continue_text_layer);
+    GRect frame = layer_get_frame(tl);
     size_t len = strlen(s_note_buf);
     const char *tail = len > 90 ? s_note_buf + len - 90 : s_note_buf;
-    text_layer_set_text(s_continue_text_layer, tail);
+    layer_set_frame(tl, GRect(frame.origin.x, frame.origin.y, frame.size.w, 2000));
+    for (;;) {
+        if (tail != s_note_buf) {
+            while (*tail && *tail != ' ') tail++;   // start on a word boundary
+            while (*tail == ' ') tail++;
+        }
+        text_layer_set_text(s_continue_text_layer, tail);
+        if (!*tail || text_layer_get_content_size(s_continue_text_layer).h <= frame.size.h) break;
+        tail++;
+    }
+    layer_set_frame(tl, frame);
     if (s_continue_timer) app_timer_cancel(s_continue_timer);
     s_continue_timer = app_timer_register(delay_ms, continue_timer_cb, NULL);
 }
@@ -1140,7 +1251,7 @@ static void continue_window_load(Window *window) {
     layer_add_child(root, text_layer_get_layer(s_continue_meta_layer));
     y += meta_h + 8;
     s_continue_text_layer = continue_text_layer(GRect(8, y, b.size.w - 16, b.size.h - y),
-                                                app_font(AF_FOOTER), GColorLightGray);
+                                                app_font(AF_BODY), GColorLightGray);
     layer_add_child(root, text_layer_get_layer(s_continue_text_layer));
     window_set_click_config_provider(window, continue_click_config);
 }
@@ -1188,10 +1299,6 @@ static void dictation_callback(DictationSession *session,
         s_last_speech_ms = now_ms();
         APP_LOG(APP_LOG_LEVEL_INFO, "Dictation chunk %d: %s", s_chunk_count, transcription);
         if (!user_stopped && dictation_wants_more()) {
-            vibes_enqueue_custom_pattern((VibePattern) {
-                .durations = s_chunk_end_vibe,
-                .num_segments = ARRAY_LENGTH(s_chunk_end_vibe),
-            });
             continue_window_show(CONTINUE_DELAY_MS);
             return;
         }
@@ -1221,7 +1328,7 @@ static void dictation_callback(DictationSession *session,
             continue_window_show(SILENT_RESTART_MS);
             return;
         }
-        // Anything else (an error, the minute is up) keeps what was captured.
+        // Anything else (an error, time is up) keeps what was captured.
         dictation_finish();
         return;
     }
@@ -1642,18 +1749,58 @@ static void confirm_window_unload(Window *window) {
 }
 
 // ============================================================================
-// SUCCESS ("DUMPED") WINDOW — post-dump confirmation, auto-dismiss ~1.5s
+// SUCCESS ("DUMPED") WINDOW — post-dump confirmation, auto-dismiss unless scrolled
 // ============================================================================
 
-#define SUCCESS_DISMISS_MS 10000
+#define SUCCESS_DISMISS_MS 4000
 
-#if PBL_DISPLAY_HEIGHT <= 168
-#define SUCCESS_Y_SHIFT    5   // clear the status header / medallion
-#define SUCCESS_DUMPED_GAP 5   // breathing room under "DUMPED" before the tile
+// Header block: medallion on the left, title ("SENT" / "SENDING") to its
+// right with the destination chip under the title. The transcript starts
+// right below, so most of the screen is the note itself.
+#define SUCCESS_TILE 20
+typedef struct {
+    int    r;          // medallion radius
+    GPoint med;        // medallion center
+    int    text_x;     // left edge of the title / chip column
+    int    title_y, title_h;
+    GFont  title_font;
+    int    chip_cy;    // destination chip center line
+    int    bottom;     // first free y below the block
+} SuccessHeader;
+
+static SuccessHeader success_header(int w) {
+    SuccessHeader hd;
+    const char *title = s_success_pending ? "SENDING" : "SENT";
+    hd.r = w <= 144 ? 16 : 22;
+    int gap = 8;
+    // The biggest title that fits beside the medallion.
+    hd.title_font = app_font(AF_TITLE);
+    hd.title_h = app_font_h(AF_TITLE);
+    int col_w = w - 2 * hd.r - gap - 16;
+    if (graphics_text_layout_get_content_size(title, hd.title_font, GRect(0, 0, w, hd.title_h + 6),
+            GTextOverflowModeFill, GTextAlignmentLeft).w > col_w) {
+        hd.title_font = app_font(AF_HEADER);
+        hd.title_h = app_font_h(AF_HEADER);
+    }
+    int col_h = hd.title_h + 4 + SUCCESS_TILE;
+    int block_h = col_h > 2 * hd.r + 4 ? col_h : 2 * hd.r + 4;
+#ifdef PBL_ROUND
+    // Centered as a group; dropped a little so the corners clear the bezel.
+    int top = STATUS_H + 18;
+    int x0 = (w - (2 * hd.r + gap + col_w * 3 / 4)) / 2;
 #else
-#define SUCCESS_Y_SHIFT    0
-#define SUCCESS_DUMPED_GAP 0
+    int top = STATUS_H + 8;
+    int x0 = 8;
 #endif
+    hd.med = GPoint(x0 + hd.r, top + block_h / 2);
+    hd.text_x = x0 + 2 * hd.r + gap;
+    int col_top = top + (block_h - col_h) / 2;
+    // Nudge up: Pebble text renders with top leading.
+    hd.title_y = col_top - hd.title_h / 6;
+    hd.chip_cy = col_top + hd.title_h + 4 + SUCCESS_TILE / 2;
+    hd.bottom = top + block_h + 6;
+    return hd;
+}
 
 // Larger check mark for the medallion (scaled by radius r around center c).
 static void draw_check_big(GContext *ctx, GPoint c, int r, GColor fg) {
@@ -1669,10 +1816,7 @@ static void draw_check_big(GContext *ctx, GPoint c, int r, GColor fg) {
 static void success_canvas_update(Layer *layer, GContext *ctx) {
     GRect bounds = layer_get_bounds(layer);
     int w = bounds.size.w;
-    int h = bounds.size.h;
 
-    const int y_shift = SUCCESS_Y_SHIFT;
-    const int dumped_gap = SUCCESS_DUMPED_GAP;
     const char *header = s_success_pending ? "SENDING" : "SAVED";
 
     graphics_context_set_fill_color(ctx, C_SCREEN);
@@ -1695,46 +1839,43 @@ static void success_canvas_update(Layer *layer, GContext *ctx) {
     draw_status_divider(ctx, bounds);
 #endif
 
+    SuccessHeader hd = success_header(w);
+
     // Medallion: ring + check (ring + three dots while still sending)
-    int med_cy = h * 27 / 100 + y_shift;
-    int med_r  = 22;
     graphics_context_set_stroke_color(ctx, C_ON_SCREEN);
     graphics_context_set_stroke_width(ctx, 2);
-    graphics_draw_circle(ctx, GPoint(w / 2, med_cy), med_r);
+    graphics_draw_circle(ctx, hd.med, hd.r);
     if (s_success_pending) {
         graphics_context_set_fill_color(ctx, C_ON_SCREEN);
         for (int i = -1; i <= 1; i++) {
-            graphics_fill_circle(ctx, GPoint(w / 2 + i * med_r * 45 / 100, med_cy), 3);
+            graphics_fill_circle(ctx, GPoint(hd.med.x + i * hd.r * 45 / 100, hd.med.y), 3);
         }
     } else {
-        draw_check_big(ctx, GPoint(w / 2, med_cy + 2), med_r, C_ON_SCREEN);
+        draw_check_big(ctx, GPoint(hd.med.x, hd.med.y + 2), hd.r, C_ON_SCREEN);
     }
 
-    // Title "DUMPED" / "SENDING"
+    // Title "SENT" / "SENDING", left-aligned beside the medallion
+    int col_w = w - hd.text_x - 4;
     graphics_context_set_text_color(ctx, C_ON_SCREEN);
-    graphics_draw_text(ctx, s_success_pending ? "SENDING" : "DUMPED", app_font(AF_TITLE),
-        GRect(0, h * 43 / 100 + y_shift, w, app_font_h(AF_TITLE) + 6),
-        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+    graphics_draw_text(ctx, s_success_pending ? "SENDING" : "SENT", hd.title_font,
+        GRect(hd.text_x, hd.title_y, col_w, hd.title_h + 6),
+        GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
-    // Destination chip: bordered tile + name caps, centered as a group. Not
-    // drawn until the phone has said where the note is going.
+    // Destination chip under the title: bordered tile + name. Not drawn until
+    // the phone has said where the note is going.
     if (s_success_dest < 0) return;
     const char *name = dest_full_name(s_success_dest);
     GFont chip_font = app_font(AF_STATUS);
     int chip_h = app_font_h(AF_STATUS);
-    GSize ns = graphics_text_layout_get_content_size(name, chip_font,
-        GRect(0, 0, w, chip_h), GTextOverflowModeFill, GTextAlignmentLeft);
-    int tile = 20, gap = 6;
-    int group_w = tile + gap + ns.w;
-    int gx = (w - group_w) / 2;
-    int chip_cy = h * 64 / 100 + y_shift + dumped_gap;
-    draw_dest_tile(ctx, s_success_dest, GPoint(gx + tile / 2, chip_cy), tile, C_ON_SCREEN);
+    int gap = 6;
+    draw_dest_tile(ctx, s_success_dest, GPoint(hd.text_x + SUCCESS_TILE / 2, hd.chip_cy),
+                   SUCCESS_TILE, C_ON_SCREEN);
     graphics_context_set_text_color(ctx, C_ON_SCREEN);
-    // Nudge up: Pebble text renders with top leading, so a rect-centered line
-    // sits visually low against the geometrically-centered tile.
+    // Nudge up: a rect-centered line sits visually low against the tile.
     graphics_draw_text(ctx, name, chip_font,
-        GRect(gx + tile + gap, chip_cy - chip_h / 2 - chip_h / 10, ns.w + 4, chip_h + 4),
-        GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+        GRect(hd.text_x + SUCCESS_TILE + gap, hd.chip_cy - chip_h / 2 - chip_h / 10,
+              col_w - SUCCESS_TILE - gap, chip_h + 4),
+        GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
     // The webhook reply and the full transcript are text layers below this,
     // in the same scroll layer (success_relayout).
 }
@@ -1758,19 +1899,20 @@ static void success_click_config(void *ctx) {
     window_single_click_subscribe(BUTTON_ID_BACK,   success_dismiss_click);
 }
 
-// Scrolling means the user is reading: stop the auto-dismiss.
+// Scrolling means the user is reading: stop the auto-dismiss for good, even
+// across the SENDING → DUMPED flip.
 static void success_scrolled(ScrollLayer *scroll_layer, void *ctx) {
+    s_success_scrolled = true;
     if (s_success_timer) { app_timer_cancel(s_success_timer); s_success_timer = NULL; }
 }
 
 // Lay out the reply + transcript under the chip and size the scroll content.
-// Auto-dismiss only once the send is confirmed and everything fits on one
-// screen; a transcript that needs scrolling stays until dismissed.
+// Auto-dismiss once the send is confirmed, unless the user has scrolled.
 static void success_relayout(void) {
     if (!s_success_scroll_layer) return;
     GRect b = layer_get_frame(scroll_layer_get_layer(s_success_scroll_layer));
     int w = b.size.w, h = b.size.h;
-    int y = h * 70 / 100 + SUCCESS_Y_SHIFT + SUCCESS_DUMPED_GAP;
+    int y = success_header(w).bottom;
     int tw = w - 16;
 
     // Two-way webhook reply (if any) first — the endpoint talked back.
@@ -1796,7 +1938,7 @@ static void success_relayout(void) {
     if (s_success_canvas_layer) layer_mark_dirty(s_success_canvas_layer);
 
     if (s_success_timer) { app_timer_cancel(s_success_timer); s_success_timer = NULL; }
-    if (!s_success_pending && content_h <= h) {
+    if (!s_success_pending && !s_success_scrolled) {
         s_success_timer = app_timer_register(SUCCESS_DISMISS_MS, success_dismiss_cb, NULL);
     }
 }
@@ -1805,7 +1947,7 @@ static TextLayer *success_text_layer_create(GColor color) {
     TextLayer *t = text_layer_create(GRect(0, 0, 0, 0));
     text_layer_set_background_color(t, GColorClear);
     text_layer_set_text_color(t, color);
-    text_layer_set_font(t, app_font(AF_FOOTER));
+    text_layer_set_font(t, app_font(AF_BODY));
     text_layer_set_text_alignment(t, GTextAlignmentCenter);
     text_layer_set_overflow_mode(t, GTextOverflowModeWordWrap);
     return t;
@@ -2834,6 +2976,7 @@ static void detail_window_push(int idx) {
 }
 
 static void success_window_create_and_push(void) {
+    s_success_scrolled = false;
     if (s_success_window) {
         if (window_stack_contains_window(s_success_window)) {
             window_stack_remove(s_success_window, false);
@@ -2944,6 +3087,7 @@ static void init(void) {
     s_brain_bmp = gbitmap_create_with_resource(RESOURCE_ID_IMG_BRAIN_MIC);
 
     // Load persistent data
+    s_history_full = malloc(MAX_HISTORY * HISTORY_FULL_LEN);
     history_load_from_persist();
     reminders_load_from_persist();
 
@@ -2960,6 +3104,15 @@ static void init(void) {
     s_cfg_skip_confirm       = persist_read_bool(PERSIST_SKIP_CONFIRM);
     s_cfg_continuous         = persist_read_bool(PERSIST_CONTINUOUS);
     s_cfg_silence_timeout_s  = persist_read_int(PERSIST_SILENCE_TIMEOUT);
+    s_cfg_max_note_min = persist_exists(PERSIST_MAX_NOTE_MIN)
+                         ? max_note_min_clamp(persist_read_int(PERSIST_MAX_NOTE_MIN))
+                         : MAX_NOTE_MIN_DEFAULT;
+    s_cfg_vibe_start = persist_exists(PERSIST_VIBE_START)
+                       ? vibe_preset_clamp(persist_read_int(PERSIST_VIBE_START))
+                       : VIBE_PRESET_DEFAULT;
+    s_cfg_vibe_stop  = persist_exists(PERSIST_VIBE_STOP)
+                       ? vibe_preset_clamp(persist_read_int(PERSIST_VIBE_STOP))
+                       : VIBE_PRESET_DEFAULT;
     s_cfg_quick_auto_exit    = !persist_exists(PERSIST_QUICK_AUTO_EXIT)
                                || persist_read_bool(PERSIST_QUICK_AUTO_EXIT);
 
@@ -2979,6 +3132,7 @@ static void deinit(void) {
         s_dictation_session = NULL;
     }
     if (s_brain_bmp)         { gbitmap_destroy(s_brain_bmp); s_brain_bmp = NULL; }
+    free(s_history_full); s_history_full = NULL;
     if (s_fallback_window)   { window_destroy(s_fallback_window);   }
     if (s_success_window)    { window_destroy(s_success_window);    }
     if (s_continue_window)   { window_destroy(s_continue_window);   }

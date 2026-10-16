@@ -13,10 +13,6 @@
     "sdkVersion": "3",
     "enableMultiJS": true,
     "targetPlatforms": [
-      "basalt",
-      "chalk",
-      "gabbro",
-      "diorite",
       "emery"
     ],
     "watchapp": {
@@ -54,7 +50,11 @@
       "QUICK_AUTO_EXIT",
       "SKIP_CONFIRM",
       "CONTINUOUS_DICTATION",
-      "SILENCE_TIMEOUT"
+      "SILENCE_TIMEOUT",
+      "MAX_NOTE_MIN",
+      "VIBE_START",
+      "VIBE_STOP",
+      "VIBE_PREVIEW"
     ],
     "resources": {
       "media": [

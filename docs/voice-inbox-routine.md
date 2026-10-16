@@ -1,6 +1,6 @@
 # Voice inbox: Brain Dump → Claude Code routine
 
-Every note you dictate goes to a Claude Code routine. The routine picks an action from how the note starts: "remind me to…" adds a TickTick task, "email me…" researches and emails you the answer, "add to buffer…" / "save to Readwise…" (or "add to Reader…" etc.) researches and saves it to Readwise Reader (tag `buffer`), "create an event" / "make an event" / "appointment…" adds a Google Calendar event, and anything else becomes a TickTick note. Each run is also a Claude Code session at claude.ai/code that you can open later.
+Every note you dictate goes to a Claude Code routine. The routine picks an action from the note's opening instruction (filler like "please" or "can you" is ignored): "remind me to/about…" adds a TickTick task, "email me…" / "send me … by email" emails it to you, "add to buffer…" / "add a summary of this to Readwise…" (or Reader) saves it to Readwise Reader (tag `buffer`), "create an event" / "make an event" / "appointment…" adds a Google Calendar event, and anything else becomes a TickTick note. For email, buffer and TickTick, naming a topic ("a summary of the history of X") gets it researched, while pointing at your own words ("a summary of what I say here…", "email me the following…") gets a summary of what you said plus the verbatim transcript. Each run is also a Claude Code session at claude.ai/code, and everything it creates ends with a "Continue in Claude" link to that session, so you can open it later and keep discussing the answer there. Each run also adds a row to the Notion database "Pebble Voice Router log" (raw note, action, result, status, and a link to the session).
 
 ## 1. Create the routine (web only)
 
@@ -36,11 +36,14 @@ The extra-headers field comes from upstream PR #16, which is merged into the `vo
 
 Also tick **Send my exact words** in the webhook section, so the routine sees "remind me to…", "email me…" and the other trigger phrases as you said them.
 
+Leave **Also ring same-day reminders on the watch** ticked (it's on by default). See "Things to know" below.
+
 Under **Routing**, turn on **Disable smart routing** and set **Default destination** to **Webhook**. Then every note goes to the routine, and Claude does the classifying instead of the keyword matcher.
 
 ## 3. Things to know
 
 - **Watch reply:** after a send, the watch shows the start of the API's JSON response (`{"type":"routine_fire",…`). The real result arrives later in TickTick, email, Reader or your calendar.
+- **Same-day reminders also ring on the watch:** TickTick on the iPhone may not alert for a new task until its app has synced it, and a backgrounded app may not sync in time. So when a note starts with "remind me" and gives a clock time or a delay ("at 5pm", "in 20 minutes") that falls later today, Brain Dump also pins a Timeline reminder on the watch, parsing the time itself on the phone. You may get two alerts. A note retried from the queue gets no pin, because "in 20 minutes" would no longer mean the same moment.
 - **Possible duplicates:** the endpoint has no idempotency key. If a send times out after the routine already started and you choose "Retry later", the note can run twice.
 - **Limits:** 30 fires per hour per routine. Each run uses your Claude subscription the same way an interactive Claude Code session does.
 - **Token:** it can only start this one routine. Fire text arrives marked as untrusted, which is why the prompt (section 4) explicitly opts in to acting on it, and only within a short list of allowed actions.

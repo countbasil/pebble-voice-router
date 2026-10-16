@@ -600,6 +600,26 @@ function extractTime(text, nowHour) {
     return null;
 }
 
+// A delay counted from now: "in 5 minutes", "in two hours", "in half an hour".
+// English only. Returns ms, or null when the note names no delay.
+var _REL_WORDS = {
+    'a':1, 'an':1, 'fifteen':15, 'twenty':20, 'thirty':30, 'forty':40,
+    'forty five':45, 'fifty':50, 'ninety':90
+};
+var _REL_RE = new RegExp('\\bin\\s+(\\d{1,3}|forty[- ]five|fifteen|twenty|thirty|forty|fifty|ninety|' +
+                         _NUM_PAT + '|an|a)\\s+(minutes?|mins?|hours?|hrs?)\\b');
+
+function extractRelativeOffset(text) {
+    var t = text.toLowerCase();
+    if (/\bin\s+(?:a\s+)?half\s+(?:an\s+)?hour\b/.test(t)) return 30 * 60000;
+    var m = t.match(_REL_RE);
+    if (!m) return null;
+    var n = /^\d/.test(m[1]) ? parseInt(m[1], 10)
+          : (_REL_WORDS[m[1].replace('-', ' ')] || _NUM_WORDS[m[1]]);
+    if (!n) return null;
+    return n * (m[2].charAt(0) === 'h' ? 3600000 : 60000);
+}
+
 // The date-only shape the task APIs expect, built from the LOCAL calendar day:
 // toISOString() would move a note dictated shortly after local midnight (east
 // of UTC) back to the previous day.
@@ -1102,13 +1122,13 @@ function webhookErrorText(status, body) {
 }
 
 // A Claude Code routine's fire endpoint answers with session JSON, which reads
-// as noise on the watch. Say what it means instead; the routine's own result
-// lands later (TickTick, email, or a push notification). Other replies pass
-// through unchanged.
+// as noise on the watch. Treat it as no reply ('webhook'), so the watch just
+// shows SENT; the routine's own result lands later (TickTick, email, or a push
+// notification). Other replies pass through unchanged.
 function describeWebhookReply(body) {
     try {
         var r = JSON.parse(body);
-        if (r && r.type === 'routine_fire') return 'Claude routine started. Result arrives shortly.';
+        if (r && r.type === 'routine_fire') return 'webhook';
     } catch (e) {}
     return body;
 }
@@ -1679,8 +1699,11 @@ var TIMELINE_DEFAULT_HOUR = 9;
 
 // Resolve the note's due date/time to an absolute instant in ms, or null when
 // it names neither. extractDueDate already falls back to today for a bare time;
-// its date is read as a local date, as formatDueLabel does.
+// its date is read as a local date, as formatDueLabel does. A delay ("in 20
+// minutes") counts from now, rounded to the minute.
 function timelinePinTime(text) {
+    var rel = extractRelativeOffset(text);
+    if (rel) return Math.round((Date.now() + rel) / 60000) * 60000;
     var iso = extractDueDate(text);
     if (!iso) return null;
     var tm = extractTime(text);
@@ -1753,6 +1776,41 @@ function sendToTimeline(text, cfg, cb, retryState) {
         console.log('Timeline token error: ' + err);
         cb(false, 'Timeline unavailable', state);
     });
+}
+
+// A clock time spelled out in the note, as opposed to a vague "tonight" or "in
+// the morning" that extractTime also resolves.
+var _CLOCK_RE = new RegExp(
+    '\\b\\d{1,2}(?::\\d{2})?\\s*[ap]\\.?\\s?m\\b|\\b\\d{1,2}:\\d{2}\\b|' +
+    '\\b(?:\\d{1,2}|' + _NUM_PAT + ')\\s*(?:[ap]\\.?\\s?m\\b|o\'?clock\\b)|' +
+    '\\bat\\s+(?:\\d{1,2}|' + _NUM_PAT + ')\\b|\\bnoon\\b|\\bmidnight\\b');
+
+// A note that opens by asking to be reminded at a clock time or after a delay.
+// That is what an AI on the other end of the webhook (the voice inbox routine)
+// turns into a reminder that rings. A day alone or a vague "tonight" gets no
+// alarm there, so it gets none here either.
+function isTimedReminderNote(text) {
+    var t = text.trim().toLowerCase();
+    var opener = /^(?:(?:please|can\s+you|could\s+you|would\s+you|okay|ok|hey)[\s,]+)*(?:remind\s+me|(?:set\s+(?:a\s+)?)?reminder|show\s+me\s+this\s+in)\b/;
+    if (!opener.test(t)) return false;
+    if (extractRelativeOffset(t)) return true;
+    return _CLOCK_RE.test(t) && !!extractTime(t);
+}
+
+// The reminder app on the phone (TickTick, for the voice inbox) only rings once
+// it has synced the task the webhook's AI created, and a backgrounded app may
+// not sync in time. So a timed reminder due later today also rings from the
+// watch's own timeline. Live sends only: a queued retry would resolve "in 5
+// minutes" against the wrong now. Fire-and-forget, like pinTaskReminder.
+function pinWebhookReminder(text, cfg, ts) {
+    if (cfg.webhook_timeline_reminder === false || !isTimedReminderNote(text)) return;
+    var now = new Date();
+    var pinTime = timelinePinTime(text);
+    if (!pinTime || pinTime <= now.getTime() ||
+        new Date(pinTime).toDateString() !== now.toDateString()) return;
+    sendToTimeline(cleanNoteText(text), cfg, function(ok, err) {
+        console.log(ok ? 'Timeline reminder pinned for webhook note' : 'Timeline reminder failed: ' + err);
+    }, { timestamp: ts, pinTime: pinTime });
 }
 
 // ============================================================================
@@ -1891,6 +1949,8 @@ function stripDateTimeFromText(text) {
         TL + '\\d{1,2}h\\s?\\d{0,2}',                               // 15h / à 6h30
         TL + '\\d{1,2}\\s+(?:heures?|uhr)(?:\\s+\\d{1,2})?',        // um 15 Uhr / à 6 heures
         TL + '(?:noon|midnight|lunchtime)',
+        _REL_RE.source,                                             // in 5 minutes
+        'in\\s+(?:a\\s+)?half\\s+(?:an\\s+)?hour',
         tailOnly('(?:in\\s+the\\s+)?(?:this\\s+)?(?:morning|afternoon|evening)'),
         '(?:at\\s+)?(?:tonight|midnight|noon|lunchtime)',
         tailOnly('(?:at\\s+)?(?:dinner|breakfast|lunch)(?:time)?'),
@@ -2050,6 +2110,7 @@ function routeAndSend(text, isFollowup) {
             return;
         }
         addHistory(sendText, di);
+        if (dest === 'webhook') pinWebhookReminder(text, cfg, ts);
         // A live send just succeeded → the network is up, so drain any backlog.
         flushQueue();
         if (dest === 'ai') {
@@ -2165,6 +2226,39 @@ function computeDestMask(cfg) {
     return mask;
 }
 
+// Mic start/stop vibrations. The array position is the index the watch uses
+// (0 = off), so the order must match s_vibe_start_ms / s_vibe_stop_ms in
+// main.c. Labels name the pattern, not a strength, so they don't read like
+// the watch's own Low/Medium/High vibe intensity.
+var VIBE_START_PRESETS = [
+    { id: 'off',    label: 'Off' },
+    { id: 'taps',   label: '3 quick taps (3 \u00d7 100ms)' },
+    { id: 'pulses', label: '3 pulses (3 \u00d7 175ms)' },
+    { id: 'long',   label: '3 long pulses (3 \u00d7 250ms)' }
+];
+var VIBE_STOP_PRESETS = [
+    { id: 'off',   label: 'Off' },
+    { id: 'short', label: 'Short buzz (0.4s)' },
+    { id: 'long',  label: 'Long buzz (0.7s)' },
+    { id: 'xlong', label: 'Extra-long buzz (1s)' }
+];
+var VIBE_PRESET_DEFAULT = 2;
+
+function vibePresetIndex(presets, id) {
+    for (var i = 0; i < presets.length; i++) {
+        if (presets[i].id === id) return i;
+    }
+    return VIBE_PRESET_DEFAULT;
+}
+
+// Choices for "Keep listening for up to"; the watch clamps to 1..30.
+var MAX_NOTE_MIN_CHOICES = [1, 2, 3, 5, 10, 15];
+
+function maxNoteMinutes(cfg) {
+    var n = parseInt(cfg.max_note_min, 10);
+    return MAX_NOTE_MIN_CHOICES.indexOf(n) >= 0 ? n : 1;
+}
+
 // Everything the watch mirrors from the settings page. Sent on 'ready' and
 // again whenever settings are saved, so both paths always agree.
 // Exiting to the watchface after a quick-launched note is the default: that
@@ -2178,7 +2272,11 @@ function watchMirroredSettings(cfg) {
         SKIP_CONFIRM: cfg.skip_confirm ? 1 : 0,
         CONTINUOUS_DICTATION: cfg.continuous_dictation ? 1 : 0,
         // Seconds of silence that end a continuous note; 0 = never.
-        SILENCE_TIMEOUT: cfg.silence_stop ? (parseInt(cfg.silence_timeout, 10) || 10) : 0
+        SILENCE_TIMEOUT: cfg.silence_stop ? (parseInt(cfg.silence_timeout, 10) || 10) : 0,
+        // Minutes a continuous note may run, pauses included.
+        MAX_NOTE_MIN: maxNoteMinutes(cfg),
+        VIBE_START: vibePresetIndex(VIBE_START_PRESETS, cfg.vibe_start),
+        VIBE_STOP: vibePresetIndex(VIBE_STOP_PRESETS, cfg.vibe_stop)
     };
 }
 
@@ -2318,6 +2416,12 @@ function openSettings() {
     }
     function chk(v) { return v ? 'checked' : ''; }
     function sel(a, b) { return a === b ? 'selected' : ''; }
+    function vibeOptions(presets, id) {
+        var current = vibePresetIndex(presets, id);
+        return presets.map(function (p, i) {
+            return '<option value="' + p.id + '" ' + (i === current ? 'selected' : '') + '>' + p.label + '</option>';
+        }).join('');
+    }
 
     // One field for every destination that talks to a URL the user supplies,
     // so each service's section offers the same thing in the same words. The
@@ -2367,6 +2471,8 @@ function openSettings() {
     function render(notionStatus, joplinFolders) {
     var joplinNotebookField = joplinNotebookInput(joplinFolders);
     var html = '<!DOCTYPE html><html><head>' +
+    // Without it the webview reads the page as Latin-1 and mangles ×, →, — etc.
+    '<meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<style>' +
     'body{font-family:sans-serif;background:#111;color:#eee;padding:16px;padding-bottom:68px;margin:0}' +
@@ -2407,8 +2513,15 @@ function openSettings() {
     '<span>Send every note without review</span></label>' +
     '<p class="note">Notes go out as soon as you finish speaking. The watch shows the full text while it sends and on the success screen, so you can check it afterwards. AI follow-up questions are still reviewed.</p>' +
     '<label><input type="checkbox" id="continuous_dictation" ' + chk(cfg.continuous_dictation) + '>' +
-    '<span>Keep listening for up to a minute</span></label>' +
-    '<p class="note">The watch stops listening at each pause (and after 15 seconds), then buzzes three times. With this on it starts listening again after a short "KEEP TALKING" screen and joins everything into one note. On that screen Select saves the note and Back cancels it; Back while listening also cancels.</p>' +
+    '<span>Keep listening after pauses</span></label>' +
+    '<label>For up to:' +
+    '<select id="max_note_min">' +
+    MAX_NOTE_MIN_CHOICES.map(function (n) {
+        return '<option value="' + n + '" ' + sel(String(maxNoteMinutes(cfg)), String(n)) + '>' + n + (n === 1 ? ' minute' : ' minutes') + '</option>';
+    }).join('') +
+    '</select></label>' +
+    '<p class="note">The watch stops listening at each pause (and after 15 seconds). With this on it starts listening again after a short "KEEP TALKING" screen and joins everything into one note. On that screen Select saves the note and Back cancels it; Back while listening also cancels.</p>' +
+    '<p class="note">Time spent pausing counts toward this limit. A note also ends early if it fills up: about 4,000 characters on Pebble Time 2 and Round 2, about 2,000 on other watches.</p>' +
     '<label><input type="checkbox" id="silence_stop" ' + chk(cfg.silence_stop) + '>' +
     '<span>Stop after silence</span></label>' +
     '<label>Silence timeout:' +
@@ -2417,7 +2530,19 @@ function openSettings() {
         return '<option value="' + n + '" ' + sel(String(cfg.silence_timeout || 10), String(n)) + '>' + n + ' seconds</option>';
     }).join('') +
     '</select></label>' +
-    '<p class="note">Off: pauses never end the note; press Select to save or Back to cancel (it still stops after a minute). On: the note is saved once you\'ve been quiet this long.</p>' +
+    '<p class="note">Off: pauses never end the note; press Select to save or Back to cancel (it still stops at the limit above). On: the note is saved once you\'ve been quiet this long.</p>' +
+    '</div>' +
+
+    '<h3>Vibrations</h3>' +
+    '<div class="section">' +
+    '<label>When recording starts:' +
+    '<select id="vibe_start">' + vibeOptions(VIBE_START_PRESETS, cfg.vibe_start) + '</select></label>' +
+    '<p class="note">Note: If long, some vibration sound may be heard at the start of the recording</p>' +
+    '<label>When recording stops:' +
+    '<select id="vibe_stop">' + vibeOptions(VIBE_STOP_PRESETS, cfg.vibe_stop) + '</select></label>' +
+    '<p class="note">Note: When a pause ends the recording, this vibration starts after the text is transcribed. Pressing Select or reaching the 15-second limit makes it vibrate right away.</p>' +
+    '<p class="note">If you change one of the above, then when you tap Save below, your watch will play the start pattern, then the stop one, so you can feel them.</p>' +
+    '<p class="note">To best feel vibrations, go to watch\'s Settings &rarr; Sounds &amp; Haptics &rarr; System and set to &ldquo;Standard - High&rdquo;.</p>' +
     '</div>' +
 
     '<h3>Quick Launch</h3>' +
@@ -2608,6 +2733,11 @@ function openSettings() {
     '<label><input type="checkbox" id="webhook_raw_text" ' + chk(cfg.webhook_raw_text) + '>' +
     '<span>Send my exact words</span></label>' +
     '<p class="note">Keeps openers like "remind me to", "note:" and "ask Claude" instead of trimming them. Turn on when an AI on the other end decides what to do with the note.</p>' +
+    '<label><input type="checkbox" id="webhook_timeline_reminder" ' + chk(cfg.webhook_timeline_reminder !== false) + '>' +
+    '<span>Also ring same-day reminders on the watch (Pebble timeline)</span></label>' +
+    '<p class="note">For notes that start with "remind me" and give a time ("at 5pm", "in 20 minutes") due later today. ' +
+    'This may lead to an extra notification, but it prevents you from possibly not getting a notification from the ' +
+    'reminder app if that app is not running to receive the new reminder when it\'s created.</p>' +
     extraHeadersField('webhook', 'X-Api-Key: ...') +
     'Trigger keywords (comma-separated):<input type="text" id="webhook_keywords"' +
     ' value=\'' + esc(cfg.webhook_keywords) + '\' placeholder="send, post, hook">' +
@@ -2830,6 +2960,9 @@ function openSettings() {
     'continuous_dictation:document.getElementById("continuous_dictation").checked,' +
     'silence_stop:document.getElementById("silence_stop").checked,' +
     'silence_timeout:parseInt(document.getElementById("silence_timeout").value,10),' +
+    'max_note_min:parseInt(document.getElementById("max_note_min").value,10),' +
+    'vibe_start:document.getElementById("vibe_start").value,' +
+    'vibe_stop:document.getElementById("vibe_stop").value,' +
     'quick_skip_confirm:document.getElementById("quick_skip_confirm").checked,' +
     'quick_auto_exit:document.getElementById("quick_auto_exit").checked,' +
     'routing_auto:!document.getElementById("disable_smart_routing").checked,' +
@@ -2879,6 +3012,7 @@ function openSettings() {
     'webhook_body:document.getElementById("webhook_body").value.trim(),' +
     'webhook_token:document.getElementById("webhook_token").value.trim(),' +
     'webhook_raw_text:document.getElementById("webhook_raw_text").checked,' +
+    'webhook_timeline_reminder:document.getElementById("webhook_timeline_reminder").checked,' +
     'webhook_headers:document.getElementById("webhook_headers").value.trim(),' +
     'webhook_keywords:document.getElementById("webhook_keywords").value.trim(),' +
     'discord_enabled:document.getElementById("discord_enabled").checked,' +
@@ -2907,7 +3041,7 @@ function openSettings() {
     '}' +
     '<\/script></body></html>';
 
-    Pebble.openURL('data:text/html,' + encodeURIComponent(html));
+    Pebble.openURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
     }
 
     // Both probes run in pkjs, not the webview: the settings page is a data: URL
@@ -2941,11 +3075,17 @@ Pebble.addEventListener('webviewclosed', function(e) {
         var cfg = JSON.parse(decodeURIComponent(e.response));
         var reopen = cfg._reopen;
         delete cfg._reopen;
+        var prev = watchMirroredSettings(getConfig());
         saveConfig(cfg);
         console.log('Config saved, dest mask recalculated');
         // Re-send the watch-mirrored settings so newly enabled destinations and
         // Quick Launch flags are available immediately.
-        sendToWatch(watchMirroredSettings(cfg));
+        var mirrored = watchMirroredSettings(cfg);
+        // Changed mic vibes play once on the watch, so they can be felt.
+        if (mirrored.VIBE_START !== prev.VIBE_START || mirrored.VIBE_STOP !== prev.VIBE_STOP) {
+            mirrored.VIBE_PREVIEW = 1;
+        }
+        sendToWatch(mirrored);
         // "Save & verify target" (Notion refresh): reopen settings so the pkjs
         // probe re-runs against the just-saved target.
         if (reopen) openSettings();

@@ -324,6 +324,73 @@ check('still pins once a refreshed token created the task',
 check('pins only once after a token refresh', refreshed.requests.length, 4);
 
 // ---------------------------------------------------------------------------
+section('Relative times');
+check('reads a delay in minutes', context.extractRelativeOffset('remind me in 5 minutes'), 300000);
+check('reads a spelled-out delay', context.extractRelativeOffset('remind me in five minutes'), 300000);
+check('reads a delay in hours', context.extractRelativeOffset('call mom in 2 hours'), 7200000);
+check('reads "in an hour"', context.extractRelativeOffset('in an hour, stretch'), 3600000);
+check('reads "in half an hour"', context.extractRelativeOffset('stretch in half an hour'), 1800000);
+check('reads "in forty-five minutes"', context.extractRelativeOffset('in forty-five minutes'), 2700000);
+check('finds no delay in a clock time', context.extractRelativeOffset('call mom at 5pm'), null);
+check('drops a trailing delay from the title',
+    context.stripDateTimeFromText('Stretch in 10 minutes'), 'Stretch');
+var relPin = context.timelinePinTime('stretch in 10 minutes');
+check('pins a delay ten minutes from now',
+    Math.abs(relPin - (Date.now() + 600000)) <= 60000, true);
+
+// ---------------------------------------------------------------------------
+section('Webhook reminders');
+check('treats "remind me … at 5pm" as a timed reminder',
+    context.isTimedReminderNote('remind me to call mom at 5pm'), true);
+check('treats a polite delay as a timed reminder',
+    context.isTimedReminderNote('Please remind me in 10 minutes to stretch'), true);
+check('treats "show me this in one hour" as a timed reminder',
+    context.isTimedReminderNote('show me this in one hour: buy milk'), true);
+check('ignores a reminder with only a day',
+    context.isTimedReminderNote('remind me tomorrow to call mom'), false);
+check('ignores a reminder with only a vague time',
+    context.isTimedReminderNote('remind me to take out the trash tonight'), false);
+check('ignores an email request', context.isTimedReminderNote('email me the agenda at 5pm'), false);
+check('ignores a note that mentions a time', context.isTimedReminderNote('note: meeting at 5pm'), false);
+
+var WEBHOOK_CFG = {
+    webhook_enabled: true, webhook_url: 'https://hook.example/fire',
+    webhook_raw_text: true, routing_auto: false, default_dest: 'webhook'
+};
+function sendWebhookNote(dictation, extra, status) {
+    var cfg = JSON.parse(JSON.stringify(WEBHOOK_CFG));
+    for (var k in extra || {}) cfg[k] = extra[k];
+    storage.brain_dump_cfg_v1 = JSON.stringify(cfg);
+    var requests = installFakeXhr();
+    listeners.appmessage({ payload: { NOTE_TEXT: dictation } });
+    requests[0].respond(status || 200, '{"type":"routine_fire"}');
+    return requests.filter(function(r) { return r.method === 'PUT'; });
+}
+
+var hookPins = sendWebhookNote('Remind me to stretch in 10 minutes');
+check('pins a same-day reminder after the webhook accepts the note', hookPins.length, 1);
+var hookPin = hookPins.length ? JSON.parse(hookPins[0].body) : {};
+check('rings the pinned reminder', !!(hookPin.reminders && hookPin.reminders.length), true);
+check('rings at the spoken delay',
+    Math.abs(new Date(hookPin.time).getTime() - (Date.now() + 600000)) <= 60000, true);
+check('titles the pin without the opener or the delay', hookPin.layout && hookPin.layout.title, 'Stretch');
+
+var soon = new Date(Date.now() + 2 * 3600000);
+function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+var clockPins = sendWebhookNote('Remind me to call mom at ' + pad2(soon.getHours()) + ':' + pad2(soon.getMinutes()));
+check('pins a clock time only while it is still today', clockPins.length,
+    soon.toDateString() === new Date().toDateString() ? 1 : 0);
+
+check('pins nothing for a reminder due tomorrow',
+    sendWebhookNote('Remind me to call mom tomorrow at 9am').length, 0);
+check('pins nothing for a note that is not a reminder',
+    sendWebhookNote('Email me a summary of this in 5 minutes').length, 0);
+check('pins nothing when the setting is off',
+    sendWebhookNote('Remind me to stretch in 10 minutes', { webhook_timeline_reminder: false }).length, 0);
+check('pins nothing when the webhook send failed',
+    sendWebhookNote('Remind me to stretch in 10 minutes', {}, 500).length, 0);
+
+// ---------------------------------------------------------------------------
 section('Settings and watch wiring');
 var savedCfg = { timeline_enabled: true, timeline_keywords: 'ping me' };
 listeners.webviewclosed({ response: encodeURIComponent(JSON.stringify(savedCfg)) });
@@ -345,6 +412,10 @@ check('offers the Google Tasks timeline reminder toggle',
     settingsHtml.indexOf('id="tasks_timeline_reminder"') >= 0, true);
 check('reads the Google Tasks reminder toggle back when saving',
     settingsHtml.indexOf('tasks_timeline_reminder:document.getElementById("tasks_timeline_reminder").checked') >= 0, true);
+check('turns on webhook timeline reminders when the setting was never saved',
+    /id="webhook_timeline_reminder" checked/.test(settingsHtml), true);
+check('reads the webhook reminder toggle back when saving',
+    settingsHtml.indexOf('webhook_timeline_reminder:document.getElementById("webhook_timeline_reminder").checked') >= 0, true);
 check('dims the timeline with the other services when smart routing is off',
     settingsHtml.indexOf('"joplin","timeline"') >= 0, true);
 
