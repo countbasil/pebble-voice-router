@@ -52,6 +52,7 @@
       "CONTINUOUS_DICTATION",
       "SILENCE_TIMEOUT",
       "MAX_NOTE_MIN",
+      "NOTE_RECORDING",
       "VIBE_START",
       "VIBE_STOP",
       "VIBE_PREVIEW"

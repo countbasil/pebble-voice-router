@@ -1133,6 +1133,11 @@ function describeWebhookReply(body) {
     return body;
 }
 
+// "[Recording: 48s, 1m 12s (not recognized); total 2m]"
+function recordingTrailer(recording) {
+    return '[Recording: ' + String(recording).replace(/[\[\]\r\n]/g, ' ') + ']';
+}
+
 function sendToWebhook(text, cfg, cb) {
     var url   = cfg.webhook_url;
     var verb  = (cfg.webhook_verb  || 'POST').toUpperCase();
@@ -2063,7 +2068,7 @@ function pickDest(text, enabled, cfg, isFollowup) {
     return dest;
 }
 
-function routeAndSend(text, isFollowup) {
+function routeAndSend(text, isFollowup, recording) {
     var cfg     = getConfig();
     var enabled = getEnabledDests(cfg);
     // Captured once so a failed send keeps the note's original dictation time
@@ -2090,6 +2095,11 @@ function routeAndSend(text, isFollowup) {
     // A webhook can opt out: an LLM on the other end (e.g. a Claude Code
     // routine) classifies better with "remind me…" / "note:" still in place.
     var sendText = (dest === 'webhook' && cfg.webhook_raw_text) ? text.trim() : cleanNoteText(text);
+    // How long each take was, from the watch, as a last line the receiving
+    // end can strip and log (the voice inbox routine does).
+    if (dest === 'webhook' && cfg.webhook_recording && recording) {
+        sendText += '\n\n' + recordingTrailer(recording);
+    }
 
     var DEST_LABEL = { tasks: 'Tasks', notion: 'Notion', ai: 'AI', webhook: 'Webhook', local: 'Local', todoist: 'Todoist', nextcloud: 'Nextcloud Notes', nextcloud_tasks: 'Nextcloud Tasks', discord: 'Discord', joplin: 'Joplin', timeline: 'Timeline' };
 
@@ -2356,7 +2366,7 @@ Pebble.addEventListener('appmessage', function(e) {
             }
             sendToWatch(msg2);
         } else {
-            routeAndSend(p.NOTE_TEXT, p.NOTE_IS_FOLLOWUP === 1);
+            routeAndSend(p.NOTE_TEXT, p.NOTE_IS_FOLLOWUP === 1, p.NOTE_RECORDING);
         }
     }
 
@@ -2551,7 +2561,7 @@ function openSettings() {
     '<span>Send without review</span></label>' +
     '<label><input type="checkbox" id="quick_auto_exit" ' + chk(cfg.quick_auto_exit !== false) + '>' +
     '<span>Exit app after saving</span></label>' +
-    '<p class="note">These only apply to the note a Quick Launch long-press starts itself &mdash; dictate another one from the app and it behaves as usual. Follow-up prompts and errors still stay on screen. While exiting after saving, a two-way webhook\'s reply never appears, since the success screen is skipped.</p>' +
+    '<p class="note">These only apply to the note a Quick Launch long-press starts itself &mdash; dictate another one from the app and it behaves as usual. Follow-up prompts and errors still stay on screen. With Exit on, the SENT screen shows for a few seconds and then the app closes; scroll it to keep it open, then press Select or Back to close.</p>' +
     '</div>' +
 
     '<h3>Routing</h3>' +
@@ -2733,6 +2743,9 @@ function openSettings() {
     '<label><input type="checkbox" id="webhook_raw_text" ' + chk(cfg.webhook_raw_text) + '>' +
     '<span>Send my exact words</span></label>' +
     '<p class="note">Keeps openers like "remind me to", "note:" and "ask Claude" instead of trimming them. Turn on when an AI on the other end decides what to do with the note.</p>' +
+    '<label><input type="checkbox" id="webhook_recording" ' + chk(cfg.webhook_recording) + '>' +
+    '<span>Add recording times to the note</span></label>' +
+    '<p class="note">Ends the note with a line like <code>[Recording: 48s, 1m 12s (not recognized); total 2m]</code>: how long each take was, including the wait for its transcript, and which ones failed. Useful for spotting recordings that got cut off.</p>' +
     '<label><input type="checkbox" id="webhook_timeline_reminder" ' + chk(cfg.webhook_timeline_reminder !== false) + '>' +
     '<span>Also ring same-day reminders on the watch (Pebble timeline)</span></label>' +
     '<p class="note">For notes that start with "remind me" and give a time ("at 5pm", "in 20 minutes") due later today. ' +
@@ -3012,6 +3025,7 @@ function openSettings() {
     'webhook_body:document.getElementById("webhook_body").value.trim(),' +
     'webhook_token:document.getElementById("webhook_token").value.trim(),' +
     'webhook_raw_text:document.getElementById("webhook_raw_text").checked,' +
+    'webhook_recording:document.getElementById("webhook_recording").checked,' +
     'webhook_timeline_reminder:document.getElementById("webhook_timeline_reminder").checked,' +
     'webhook_headers:document.getElementById("webhook_headers").value.trim(),' +
     'webhook_keywords:document.getElementById("webhook_keywords").value.trim(),' +

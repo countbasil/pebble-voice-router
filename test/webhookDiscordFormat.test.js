@@ -311,6 +311,31 @@ check('trims the opener by default', webhookBodyFor(hookCfg), 'Call mom');
 hookCfg.webhook_raw_text = true;
 check('sends the exact words when asked', webhookBodyFor(hookCfg), 'Remind me to call mom');
 
+section('Recording times');
+function webhookBodyWithRecording(cfg, recording) {
+    storage.brain_dump_cfg_v1 = JSON.stringify(cfg);
+    var requests = installFakeXhr();
+    context.routeAndSend('Remind me to call mom', false, recording);
+    return JSON.parse(requests[0].body).text;
+}
+check('leaves recording times out unless asked',
+    webhookBodyWithRecording(hookCfg, '48s; total 48s'), 'Remind me to call mom');
+hookCfg.webhook_recording = true;
+check('ends the note with the recording times when asked',
+    webhookBodyWithRecording(hookCfg, '48s, 1m 12s (not recognized); total 2m'),
+    'Remind me to call mom\n\n[Recording: 48s, 1m 12s (not recognized); total 2m]');
+check('sends no trailer when the watch sent no times',
+    webhookBodyWithRecording(hookCfg, undefined), 'Remind me to call mom');
+check('keeps brackets in the times from breaking the trailer',
+    context.recordingTrailer('4s [x]'), '[Recording: 4s  x ]');
+delete hookCfg.webhook_recording;
+check('NOTE_RECORDING is a declared message key',
+    JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'))
+        .pebble.messageKeys.indexOf('NOTE_RECORDING') >= 0, true);
+check('watch sends its recording log with the note',
+    /dict_write_cstring\(iter, MESSAGE_KEY_NOTE_RECORDING, s_rec_summary\)/.test(
+        fs.readFileSync(path.join(__dirname, '..', 'src', 'c', 'main.c'), 'utf8')), true);
+
 section('Settings and watch wiring');
 var savedCfg = {
     webhook_enabled: true,

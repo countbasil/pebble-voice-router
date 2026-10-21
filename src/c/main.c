@@ -26,6 +26,14 @@
 #define MAX_NOTE_MIN_DEFAULT  1   // stop chaining chunks after this many minutes
 #define CONTINUE_DELAY_MS  2000  // "keep talking" pause between chunks
 #define SILENT_RESTART_MS   300  // restart delay after a chunk that heard nothing
+// Longest take the (modified) PebbleOS records before ending it itself; must
+// match CONFIG_VOICE_DICTATION_TIMEOUT_MS. A take that ran that long was cut
+// mid-speech, so the next one starts right away instead of after KEEP TALKING.
+#define TAKE_CAP_MS       60000
+// A failed take at least this long had speech in it that is now lost (the OS
+// reports a failed take as "no speech" either way, so length is the tell).
+#define LOST_TAKE_MS      15000
+#define LOST_RESTART_MS    5000  // after the SOS buzz, before listening again
 #define STATUS_BUF_SIZE     48
 #define CONV_BUF_SIZE     1200
 #define MAX_HISTORY          8
@@ -175,6 +183,7 @@ static AppTimer *s_success_timer = NULL;
 // confirms. The full transcript scrolls below the destination chip.
 static bool         s_success_pending = false;
 static bool         s_success_scrolled = false;   // user scrolled: no auto-dismiss
+static bool         s_success_exit_on_close = false;  // Quick Launch: closing it ends the app
 static ScrollLayer *s_success_scroll_layer;
 static TextLayer   *s_success_reply_layer;
 static TextLayer   *s_success_note_layer;
@@ -271,11 +280,34 @@ static int       s_chunk_count = 0;          // chunks appended to the current n
 static uint32_t  s_dict_start_ms = 0;        // when the note's first chunk started
 static uint32_t  s_last_speech_ms = 0;       // when a chunk last came back with words
 static int       s_chunk_aborts = 0;         // back-to-back chunks the system aborted
+
+// --- Recording log ---
+// How long each take of the current note was, sent with the note (NOTE_RECORDING)
+// so a webhook can log it. A take runs from the mic turning on to its result,
+// so it includes the wait for the transcript. Silent chained takes are only
+// counted; takes that failed are listed with why.
+#define REC_LOG_SIZE 200
+static char      s_rec_log[REC_LOG_SIZE];    // "48s, 1m 12s (not recognized)"
+static char      s_rec_summary[REC_LOG_SIZE + 64];
+static uint32_t  s_rec_total_ms = 0;
+static int       s_rec_takes = 0;
+static int       s_rec_silent_n = 0;
+static uint32_t  s_rec_silent_ms = 0;
+static uint32_t  s_seg_start_ms = 0;         // mic turned on (0 = off)
+static uint32_t  s_seg_done_ms = 0;          // last take's length, not yet attributed
+static uint32_t  s_seg_end_at = 0;           // when the mic last turned off
+static int       s_rec_interruptions = 0;
 static Window   *s_continue_window = NULL;
 static TextLayer *s_continue_hero_layer;
 static TextLayer *s_continue_meta_layer;
 static TextLayer *s_continue_text_layer;
 static AppTimer *s_continue_timer = NULL;
+// What the KEEP TALKING screen is showing: the normal pause between takes,
+// a take that was lost (say it again), or a stop because something like a
+// notification popped up over the app (wait for the user).
+typedef enum { CW_KEEP, CW_LOST, CW_STOPPED } ContinueMode;
+static ContinueMode s_continue_mode = CW_KEEP;
+static bool      s_note_interrupted = false; // the app lost focus mid-note
 static bool    s_cfg_quick_auto_exit    = true;       // exit once the note is saved (default on)
 static int16_t s_resp_scroll_offset  = 0;
 static int16_t s_detail_scroll_offset = 0;
@@ -465,6 +497,63 @@ static uint32_t now_ms(void) {
     time_t s; uint16_t ms;
     time_ms(&s, &ms);
     return (uint32_t)s * 1000 + ms;
+}
+
+static void rec_format_ms(char *buf, size_t n, uint32_t ms) {
+    unsigned secs = (unsigned)((ms + 500) / 1000);
+    if (secs < 60) snprintf(buf, n, "%us", secs);
+    else           snprintf(buf, n, "%um %us", secs / 60, secs % 60);
+}
+
+static void rec_log_reset(void) {
+    s_rec_log[0] = '\0';
+    s_rec_summary[0] = '\0';
+    s_rec_total_ms = 0;
+    s_rec_takes = 0;
+    s_rec_silent_n = 0;
+    s_rec_silent_ms = 0;
+    s_seg_start_ms = 0;
+    s_seg_done_ms = 0;
+    s_rec_interruptions = 0;
+}
+
+// One take: its length and, if it failed, why (NULL = it worked).
+static void rec_log_add(uint32_t ms, const char *why) {
+    char t[16];
+    rec_format_ms(t, sizeof(t), ms);
+    size_t used = strlen(s_rec_log);
+    snprintf(s_rec_log + used, REC_LOG_SIZE - used, "%s%s%s%s%s",
+             used ? ", " : "", t, why ? " (" : "", why ? why : "", why ? ")" : "");
+    s_rec_total_ms += ms;
+    s_rec_takes++;
+}
+
+static void rec_log_silent(uint32_t ms) {
+    s_rec_silent_n++;
+    s_rec_silent_ms += ms;
+    s_rec_total_ms += ms;
+}
+
+// "48s, 1m 12s (not recognized); 3 silent restarts (21s); total 2m 21s"
+static void rec_log_finish(void) {
+    char t[16];
+    snprintf(s_rec_summary, sizeof(s_rec_summary), "%s", s_rec_log);
+    size_t used = strlen(s_rec_summary);
+    if (s_rec_silent_n > 0) {
+        rec_format_ms(t, sizeof(t), s_rec_silent_ms);
+        snprintf(s_rec_summary + used, sizeof(s_rec_summary) - used, "%s%d silent restart%s (%s)",
+                 used ? "; " : "", s_rec_silent_n, s_rec_silent_n == 1 ? "" : "s", t);
+        used = strlen(s_rec_summary);
+    }
+    if (s_rec_takes + s_rec_silent_n > 1) {
+        rec_format_ms(t, sizeof(t), s_rec_total_ms);
+        snprintf(s_rec_summary + used, sizeof(s_rec_summary) - used, "; total %s", t);
+        used = strlen(s_rec_summary);
+    }
+    if (s_rec_interruptions > 0) {
+        snprintf(s_rec_summary + used, sizeof(s_rec_summary) - used,
+                 "; interrupted by a notification");
+    }
 }
 
 static void refresh_home_idle_ui(void) {
@@ -754,6 +843,10 @@ static void appmsg_send_note(const char *text, bool is_followup) {
     dict_write_int8(iter, MESSAGE_KEY_NOTE_TYPE, 0);
     dict_write_int8(iter, MESSAGE_KEY_NOTE_IS_FOLLOWUP, is_followup ? 1 : 0);
     dict_write_int8(iter, MESSAGE_KEY_CLOCK_24H, clock_is_24h_style() ? 1 : 0);
+    if (!is_followup && s_rec_summary[0]) {
+        dict_write_cstring(iter, MESSAGE_KEY_NOTE_RECORDING, s_rec_summary);
+        APP_LOG(APP_LOG_LEVEL_INFO, "Recording: %s", s_rec_summary);
+    }
     if (app_message_outbox_send() == APP_MSG_OK) {
         set_status("Routing...");
         s_waiting_response = true;
@@ -796,18 +889,20 @@ static void appmsg_queue_retry(void) {
 }
 
 // Quick Launch + auto-exit: once the note is safely stored, buzz for eyes-free
-// feedback and pop every window, which ends the app. Returns true if it exited
-// (callers then skip the DUMPED success screen). Failure paths never call this,
-// so errors still surface on-screen.
-//
+// feedback and arm the success screen to end the app when it closes (after
+// SUCCESS_DISMISS_MS, or on Select/Back if the user scrolled to read). Failure
+// paths never call this, so errors still surface on-screen.
+static void quick_exit_arm(void) {
+    if (!(s_quick_note && s_cfg_quick_auto_exit)) return;
+    vibes_short_pulse();
+    s_success_exit_on_close = true;
+}
+
 // The exit reason is what sends the user back to the watchface: without it
 // PebbleOS returns to the launcher, which is not "out of my way" at all.
-static bool quick_exit_after_save(void) {
-    if (!(s_quick_note && s_cfg_quick_auto_exit)) return false;
-    vibes_short_pulse();
+static void quick_exit_now(void) {
     exit_reason_set(APP_EXIT_ACTION_PERFORMED_SUCCESSFULLY);
     window_stack_pop_all(true);
-    return true;
 }
 
 static void route_note(bool is_followup) {
@@ -818,13 +913,15 @@ static void route_note(bool is_followup) {
         }
         reminders_add(s_note_buf);
         set_status("Saved locally ✓");
-        if (!quick_exit_after_save()) success_window_push(DEST_LOCAL);
+        quick_exit_arm();
+        success_window_push(DEST_LOCAL);
         return;
     }
     if (s_dest_mask == 0 && !is_followup) {
         reminders_add(s_note_buf);
         set_status("Saved to reminders");
-        if (!quick_exit_after_save()) success_window_push(DEST_LOCAL);
+        quick_exit_arm();
+        success_window_push(DEST_LOCAL);
     } else {
         if (is_followup) {
             conv_append_question(s_note_buf);
@@ -970,7 +1067,8 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
                 snprintf(msg, sizeof(msg), "Sent → %s ✓", dest_full_name(dest));
                 set_status(msg);
             }
-            if (!quick_exit_after_save()) success_window_push(dest);
+            quick_exit_arm();
+            success_window_push(dest);
         } else {
             Tuple *err_t = dict_find(iter, MESSAGE_KEY_ERROR_MSG);
             const char *emsg = (err_t && err_t->value->cstring[0])
@@ -1034,6 +1132,7 @@ static void outbox_failed_callback(DictionaryIterator *iter,
 // it, or route it straight away when the review screen is skipped.
 static void continue_window_close(void) {
     s_chunk_count = 0;
+    s_note_interrupted = false;
     if (s_continue_timer) { app_timer_cancel(s_continue_timer); s_continue_timer = NULL; }
     if (s_continue_window && window_stack_contains_window(s_continue_window)) {
         window_stack_remove(s_continue_window, false);
@@ -1041,9 +1140,15 @@ static void continue_window_close(void) {
 }
 
 static void dictation_finish(void) {
+    rec_log_finish();
     bool is_followup = s_is_followup;
     s_is_followup = false;   // consume flag
     continue_window_close();
+    // Every take was lost (or silent) and the user pressed Select anyway.
+    if (!s_note_buf[0]) {
+        set_status("Nothing was captured");
+        return;
+    }
     // Hands-off capture: route straight away, no review screen — for every
     // note, or only Quick Launch ones. Follow-ups (AI thread) keep the
     // review step — they're already interactive.
@@ -1124,9 +1229,31 @@ static void mic_vibe_preview(void) {
     mic_vibe_play(s_cfg_vibe_start, s_cfg_vibe_stop, 1000);
 }
 
+// SOS (... --- ...): what was just said is lost, say it again. ~4s.
+static void lost_vibe_play(void) {
+    static const uint32_t segs[] = {
+        150, 150, 150, 150, 150, 450,    // S
+        450, 150, 450, 150, 450, 450,    // O
+        150, 150, 150, 150, 150,         // S
+    };
+    vibes_cancel();
+    vibes_enqueue_custom_pattern((VibePattern) {
+        .durations = segs, .num_segments = ARRAY_LENGTH(segs) });
+}
+
 static void voice_listening_set(bool listening) {
     if (listening == s_voice_listening) return;
     s_voice_listening = listening;
+    if (listening) {
+        // A take that ended without reaching dictation_callback was one the
+        // system retried itself ("Missed that. Try again.").
+        if (s_seg_done_ms) { rec_log_add(s_seg_done_ms, "missed, retried"); s_seg_done_ms = 0; }
+        s_seg_start_ms = now_ms();
+    } else if (s_seg_start_ms) {
+        s_seg_end_at = now_ms();
+        s_seg_done_ms = s_seg_end_at - s_seg_start_ms;
+        s_seg_start_ms = 0;
+    }
     APP_LOG(APP_LOG_LEVEL_DEBUG, "Mic %s", listening ? "listening" : "stopped");
     if (listening) mic_vibe_play(s_cfg_vibe_start, 0, 0);
     else           mic_vibe_play(0, s_cfg_vibe_stop, 0);
@@ -1180,9 +1307,7 @@ static void dictation_chunk_start(void) {
 
 static void continue_timer_cb(void *ctx) {
     s_continue_timer = NULL;
-    // Silence in a chained chunk is handled quietly instead of showing
-    // "Missed that" (a failure status in dictation_callback).
-    dictation_session_enable_error_dialogs(s_dictation_session, false);
+    s_continue_mode = CW_KEEP;
     dictation_chunk_start();
 }
 
@@ -1194,9 +1319,20 @@ static void continue_cancel_click(ClickRecognizerRef rec, void *ctx) {
     dictation_cancel();
 }
 
+static void continue_window_refresh(uint32_t delay_ms);
+
+// UP after a stop: pick the note back up.
+static void continue_resume_click(ClickRecognizerRef rec, void *ctx) {
+    if (s_continue_mode != CW_STOPPED) return;
+    s_note_interrupted = false;
+    s_continue_mode = CW_KEEP;
+    continue_window_refresh(CONTINUE_DELAY_MS);
+}
+
 static void continue_click_config(void *ctx) {
     window_single_click_subscribe(BUTTON_ID_SELECT, continue_save_click);
     window_single_click_subscribe(BUTTON_ID_BACK,   continue_cancel_click);
+    window_single_click_subscribe(BUTTON_ID_UP,     continue_resume_click);
 }
 
 // Show the tail of what's been captured so far, so the user can pick up the
@@ -1204,6 +1340,14 @@ static void continue_click_config(void *ctx) {
 // word and is trimmed from the front until it fits, so the last words show.
 static void continue_window_refresh(uint32_t delay_ms) {
     if (!s_continue_text_layer) return;
+    static const char *const hero[] = { "KEEP TALKING", "SAY THAT AGAIN", "STOPPED" };
+    static const char *const meta[] = {
+        "SELECT saves\nBACK cancels",
+        "Last part was lost\nSELECT saves the rest",
+        "A notification came in\nSELECT saves · UP resumes",
+    };
+    text_layer_set_text(s_continue_hero_layer, hero[s_continue_mode]);
+    text_layer_set_text(s_continue_meta_layer, meta[s_continue_mode]);
     Layer *tl = text_layer_get_layer(s_continue_text_layer);
     GRect frame = layer_get_frame(tl);
     size_t len = strlen(s_note_buf);
@@ -1219,8 +1363,11 @@ static void continue_window_refresh(uint32_t delay_ms) {
         tail++;
     }
     layer_set_frame(tl, frame);
-    if (s_continue_timer) app_timer_cancel(s_continue_timer);
-    s_continue_timer = app_timer_register(delay_ms, continue_timer_cb, NULL);
+    if (s_continue_timer) { app_timer_cancel(s_continue_timer); s_continue_timer = NULL; }
+    // Stopped: nothing listens again until the user says so.
+    if (s_continue_mode != CW_STOPPED) {
+        s_continue_timer = app_timer_register(delay_ms, continue_timer_cb, NULL);
+    }
 }
 
 static TextLayer *continue_text_layer(GRect frame, GFont font, GColor color) {
@@ -1275,7 +1422,30 @@ static void continue_window_show(uint32_t delay_ms) {
     if (!window_stack_contains_window(s_continue_window)) {
         window_stack_push(s_continue_window, false);
     }
+    if (s_note_interrupted) s_continue_mode = CW_STOPPED;
     continue_window_refresh(delay_ms);
+}
+
+// A note is in progress while a take is recording or KEEP TALKING is up.
+static bool note_in_progress(void) {
+    return s_voice_window ||
+           (s_continue_window && window_stack_contains_window(s_continue_window));
+}
+
+// Something (a notification, a system alert) popped up over the app. It
+// breaks the take that's recording, and anything said from here on goes
+// nowhere: buzz SOS and stop the chain until the user comes back to it.
+static void app_focus_changed(bool in_focus) {
+    if (in_focus || !note_in_progress() || s_note_interrupted) return;
+    APP_LOG(APP_LOG_LEVEL_WARNING, "Note interrupted (app lost focus)");
+    s_note_interrupted = true;
+    s_rec_interruptions++;
+    lost_vibe_play();
+    // Between takes: stop here. Mid-take: dictation_callback shows STOPPED.
+    if (!s_voice_window) {
+        s_continue_mode = CW_STOPPED;
+        continue_window_refresh(0);
+    }
 }
 
 static void dictation_callback(DictationSession *session,
@@ -1285,6 +1455,8 @@ static void dictation_callback(DictationSession *session,
     // Select while listening (or processing) means "that's the whole note".
     bool user_stopped = s_voice_select_pressed;
     voice_hook_stop();
+    uint32_t take_ms = s_seg_done_ms;   // this take's length (0 if the mic never came on)
+    s_seg_done_ms = 0;
 
     if (status == DictationSessionStatusSuccess) {
         if (!chained) {
@@ -1297,9 +1469,12 @@ static void dictation_callback(DictationSession *session,
         s_chunk_count++;
         s_chunk_aborts = 0;
         s_last_speech_ms = now_ms();
+        rec_log_add(take_ms, NULL);
         APP_LOG(APP_LOG_LEVEL_INFO, "Dictation chunk %d: %s", s_chunk_count, transcription);
         if (!user_stopped && dictation_wants_more()) {
-            continue_window_show(CONTINUE_DELAY_MS);
+            // Cut off by the take limit mid-speech: keep listening right away.
+            continue_window_show(take_ms + 2000 >= TAKE_CAP_MS ? SILENT_RESTART_MS
+                                                               : CONTINUE_DELAY_MS);
             return;
         }
         dictation_finish();
@@ -1313,6 +1488,30 @@ static void dictation_callback(DictationSession *session,
         return;
     }
 
+    // A long take that failed had speech in it, and those words are gone.
+    // Buzz SOS so the user knows to say it again; keep what came before.
+    if (take_ms >= LOST_TAKE_MS) {
+        // How long the phone took to answer, to tell real failures (which
+        // reportedly take a few seconds) from silent takes.
+        char why[32];
+        uint32_t wait_ms = now_ms() - s_seg_end_at;
+        snprintf(why, sizeof(why), "lost, failed after %u.%us",
+                 (unsigned)(wait_ms / 1000), (unsigned)(wait_ms % 1000 / 100));
+        rec_log_add(take_ms, why);
+        if (!s_note_interrupted) lost_vibe_play();   // it already buzzed
+        APP_LOG(APP_LOG_LEVEL_WARNING, "Lost a %lu ms take (status %d)",
+                (unsigned long)take_ms, (int)status);
+        if (s_cfg_continuous && !s_is_followup && !user_stopped && dictation_wants_more()) {
+            s_continue_mode = CW_LOST;
+            continue_window_show(LOST_RESTART_MS);
+            return;
+        }
+        if (chained) { dictation_finish(); return; }
+        s_is_followup = false;   // consume flag
+        set_status("Lost that. Try again");
+        return;
+    }
+
     if (chained) {
         // A chained chunk that heard nothing (or nothing it could make out)
         // is a pause: listen again, unless the silence timeout has run out.
@@ -1322,6 +1521,13 @@ static void dictation_callback(DictationSession *session,
         bool silent = status == DictationSessionStatusFailureNoSpeechDetected ||
                       status == DictationSessionStatusFailureRecognizerError ||
                       (status == DictationSessionStatusFailureSystemAborted && s_chunk_aborts <= 2);
+        if (take_ms) {
+            if (status == DictationSessionStatusFailureNoSpeechDetected) rec_log_silent(take_ms);
+            else rec_log_add(take_ms,
+                status == DictationSessionStatusFailureRecognizerError ? "not recognized" :
+                status == DictationSessionStatusFailureConnectivityError ? "no connection" :
+                status == DictationSessionStatusFailureSystemAborted ? "aborted" : "error");
+        }
         bool timed_out = s_cfg_silence_timeout_s > 0 &&
             now_ms() - s_last_speech_ms >= (uint32_t)s_cfg_silence_timeout_s * 1000;
         if (silent && !timed_out && !user_stopped && dictation_wants_more()) {
@@ -1334,6 +1540,11 @@ static void dictation_callback(DictationSession *session,
     }
 
     s_is_followup = false;   // consume flag
+    if (s_note_interrupted) {
+        s_note_interrupted = false;
+        set_status("Stopped: a notification came in");
+        return;
+    }
     switch (status) {
         case DictationSessionStatusFailureNoSpeechDetected:
             set_status("No speech detected"); break;
@@ -1637,9 +1848,10 @@ static void start_dictation(bool quick) {
     s_chunk_aborts = 0;
     s_dict_start_ms = now_ms();
     s_last_speech_ms = s_dict_start_ms;
-    // The first chunk keeps the system "Missed that" dialogs; chained chunks
-    // turn them off so silence is handled quietly (see dictation_callback).
-    dictation_session_enable_error_dialogs(s_dictation_session, true);
+    rec_log_reset();
+    s_continue_mode = CW_KEEP;
+    s_note_interrupted = false;
+    s_note_buf[0] = '\0';   // a note whose takes all fail must not resend the last one
     dictation_chunk_start();
 }
 
@@ -1880,18 +2092,22 @@ static void success_canvas_update(Layer *layer, GContext *ctx) {
     // in the same scroll layer (success_relayout).
 }
 
+static void success_close(void) {
+    if (s_success_exit_on_close) { quick_exit_now(); return; }
+    window_stack_pop(true);
+    set_status("Ready");   // restore the READY idle screen on home
+}
+
 static void success_dismiss_cb(void *ctx) {
     s_success_timer = NULL;
     if (s_success_window && window_stack_get_top_window() == s_success_window) {
-        window_stack_pop(true);
-        set_status("Ready");   // restore the READY idle screen on home
+        success_close();
     }
 }
 
 static void success_dismiss_click(ClickRecognizerRef rec, void *ctx) {
     if (s_success_timer) { app_timer_cancel(s_success_timer); s_success_timer = NULL; }
-    window_stack_pop(true);
-    set_status("Ready");
+    success_close();
 }
 
 static void success_click_config(void *ctx) {
@@ -1984,6 +2200,7 @@ static void success_window_unload(Window *window) {
     if (s_success_timer) { app_timer_cancel(s_success_timer); s_success_timer = NULL; }
     // Dismissed while still sending: the result, when it comes, gets a fresh window.
     s_success_pending = false;
+    s_success_exit_on_close = false;
     text_layer_destroy(s_success_note_layer);   s_success_note_layer  = NULL;
     text_layer_destroy(s_success_reply_layer);  s_success_reply_layer = NULL;
     layer_destroy(s_success_canvas_layer);      s_success_canvas_layer = NULL;
@@ -2978,11 +3195,15 @@ static void detail_window_push(int idx) {
 static void success_window_create_and_push(void) {
     s_success_scrolled = false;
     if (s_success_window) {
+        // Unloading the old window clears these; they belong to the new one.
+        bool pending = s_success_pending, exit_on_close = s_success_exit_on_close;
         if (window_stack_contains_window(s_success_window)) {
             window_stack_remove(s_success_window, false);
         }
         window_destroy(s_success_window);
         s_success_window = NULL;
+        s_success_pending = pending;
+        s_success_exit_on_close = exit_on_close;
     }
     s_success_window = window_create();
     window_set_window_handlers(s_success_window, (WindowHandlers) {
@@ -3068,11 +3289,15 @@ static void init(void) {
     app_message_register_inbox_received(inbox_received_callback);
     app_message_register_inbox_dropped(inbox_dropped_callback);
     app_message_register_outbox_failed(outbox_failed_callback);
-    // Outbox fits a full continuous-mode note (NOTE_TEXT up to NOTE_BUF_SIZE).
-    uint32_t outbox = NOTE_BUF_SIZE + 128;
+    // Outbox fits a full continuous-mode note (NOTE_TEXT up to NOTE_BUF_SIZE)
+    // plus its recording log.
+    uint32_t outbox = NOTE_BUF_SIZE + sizeof(s_rec_summary) + 128;
     if (outbox > app_message_outbox_size_maximum()) outbox = app_message_outbox_size_maximum();
     app_message_open(512, outbox);
 
+    app_focus_service_subscribe_handlers((AppFocusHandlers) {
+        .did_focus = app_focus_changed,
+    });
     connection_service_subscribe((ConnectionHandlers) {
         .pebble_app_connection_handler = connection_handler,
     });
@@ -3081,7 +3306,11 @@ static void init(void) {
     s_dictation_session = dictation_session_create(
         DICTATION_BUF_SIZE, dictation_callback, NULL);
     dictation_session_enable_confirmation(s_dictation_session, false);
-    dictation_session_enable_error_dialogs(s_dictation_session, true);
+    // No system "Missed that. Try again." dialogs: with them on, the OS
+    // silently restarts recording after a failed take and never tells the
+    // app, so the words are lost without warning. Off, every failure reaches
+    // dictation_callback, which warns (SOS) and handles silence quietly.
+    dictation_session_enable_error_dialogs(s_dictation_session, false);
 
     // Hero icon
     s_brain_bmp = gbitmap_create_with_resource(RESOURCE_ID_IMG_BRAIN_MIC);
