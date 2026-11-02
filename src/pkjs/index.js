@@ -1802,12 +1802,30 @@ function isTimedReminderNote(text) {
     return _CLOCK_RE.test(t) && !!extractTime(t);
 }
 
+// Dictation often loses the first syllable of "remind me" and hears "by me" or
+// "bind me" instead. Put the opener back, but only when what follows reads like
+// a reminder ("to / that / about", a delay or a clock time), so "by me a
+// coffee" is left alone. "find me" is deliberately not here: it is a real
+// request. Used for the watch pin only; the note itself goes out as dictated.
+var _MISHEARD_REMIND_RE = /^((?:(?:please|can\s+you|could\s+you|would\s+you|okay|ok|hey)[\s,]+)*)(?:by|bind|remain|re[\s-]+mind|remined)\s+me\b/i;
+
+function normalizeReminderOpener(text) {
+    var t = text.trim();
+    var m = t.match(_MISHEARD_REMIND_RE);
+    if (!m) return text;
+    var rest = t.substring(m[0].length);
+    if (!/^[\s,]*(?:to|that|about)\b/i.test(rest) &&
+        !extractRelativeOffset(rest) && !_CLOCK_RE.test(rest.toLowerCase())) return text;
+    return m[1] + 'remind me' + rest;
+}
+
 // The reminder app on the phone (TickTick, for the voice inbox) only rings once
 // it has synced the task the webhook's AI created, and a backgrounded app may
 // not sync in time. So a timed reminder due later today also rings from the
 // watch's own timeline. Live sends only: a queued retry would resolve "in 5
 // minutes" against the wrong now. Fire-and-forget, like pinTaskReminder.
 function pinWebhookReminder(text, cfg, ts) {
+    text = normalizeReminderOpener(text);
     if (cfg.webhook_timeline_reminder === false || !isTimedReminderNote(text)) return;
     var now = new Date();
     var pinTime = timelinePinTime(text);

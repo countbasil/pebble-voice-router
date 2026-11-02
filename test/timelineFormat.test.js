@@ -375,6 +375,29 @@ check('rings at the spoken delay',
     Math.abs(new Date(hookPin.time).getTime() - (Date.now() + 600000)) <= 60000, true);
 check('titles the pin without the opener or the delay', hookPin.layout && hookPin.layout.title, 'Stretch');
 
+section('Misheard "remind me" openers');
+check('repairs "by me to … in 10 minutes"',
+    context.normalizeReminderOpener('By me to stretch in 10 minutes'), 'remind me to stretch in 10 minutes');
+check('repairs "bind me" before a delay',
+    context.normalizeReminderOpener('bind me in 5 minutes to stretch'), 'remind me in 5 minutes to stretch');
+check('repairs "re mind me" before a clock time',
+    context.normalizeReminderOpener('re mind me to call mom at 5pm'), 'remind me to call mom at 5pm');
+check('keeps a politeness lead-in',
+    context.normalizeReminderOpener('Okay, by me to stretch in 10 minutes'), 'Okay, remind me to stretch in 10 minutes');
+check('leaves "by me a coffee" alone',
+    context.normalizeReminderOpener('by me a coffee'), 'by me a coffee');
+check('leaves "find me" alone',
+    context.normalizeReminderOpener('find me a flight in 10 minutes'), 'find me a flight in 10 minutes');
+check('leaves a correct opener alone',
+    context.normalizeReminderOpener('remind me to stretch in 10 minutes'), 'remind me to stretch in 10 minutes');
+check('does not touch "by me" in the middle of a note',
+    context.normalizeReminderOpener('stand by me to the end at 5pm'), 'stand by me to the end at 5pm');
+
+var heardPins = sendWebhookNote('By me to stretch in 10 minutes');
+check('pins a reminder whose opener was misheard', heardPins.length, 1);
+var heardPin = heardPins.length ? JSON.parse(heardPins[0].body) : {};
+check('titles that pin without the opener', heardPin.layout && heardPin.layout.title, 'Stretch');
+
 var soon = new Date(Date.now() + 2 * 3600000);
 function pad2(n) { return n < 10 ? '0' + n : '' + n; }
 var clockPins = sendWebhookNote('Remind me to call mom at ' + pad2(soon.getHours()) + ':' + pad2(soon.getMinutes()));
